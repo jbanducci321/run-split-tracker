@@ -5,6 +5,8 @@ import os
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
+from split_tracker import RunTracker, parse_timestamp
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -13,6 +15,8 @@ logger = logging.getLogger("run-split-tracker")
 app = Flask(__name__)
 
 OVERLAND_ACCESS_TOKEN = os.environ.get("OVERLAND_ACCESS_TOKEN", "")
+
+tracker = RunTracker()
 
 
 def is_authorized(auth_header: str) -> bool:
@@ -32,18 +36,39 @@ def receive_overland_batch():
 
     payload = request.get_json(silent=True) or {}
     locations = payload.get("locations", [])
-    logger.info("Received %d location point(s)", len(locations))
+    trip_active = bool(payload.get("trip"))
 
+    if not trip_active:
+        if tracker.active:
+            summary = tracker.end()
+            logger.info("Trip ended. Splits recorded: %s", [s["pace_display"] for s in summary])
+        return jsonify(result="ok")
+
+    points = []
     for feature in locations:
         props = feature.get("properties", {})
+        timestamp_raw = props.get("timestamp")
+        if not timestamp_raw:
+            continue
         lon, lat = feature.get("geometry", {}).get("coordinates", [None, None])
+        if lat is None or lon is None:
+            continue
+        points.append((lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy")))
+
+    points.sort(key=lambda p: p[2])
+
+    for lat, lon, timestamp, accuracy in points:
+        split = tracker.process_point(lat, lon, timestamp, accuracy)
+        if split:
+            logger.info("MILE %d SPLIT: %s", split["mile"], split["pace_display"])
+
+    if points:
+        remaining = tracker.next_split_mile * 1609.344 - tracker.cumulative_meters
         logger.info(
-            "point lat=%s lon=%s time=%s accuracy=%sm speed=%s motion=%s",
-            lat, lon, props.get("timestamp"),
-            props.get("horizontal_accuracy"), props.get("speed"), props.get("motion"),
+            "progress: %.0fm total, %.0fm to mile %d",
+            tracker.cumulative_meters, max(remaining, 0), tracker.next_split_mile,
         )
 
-    # Overland expects this exact shape back to consider the batch delivered
     return jsonify(result="ok")
 
 
