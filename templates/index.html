@@ -57,11 +57,29 @@
       <div id="map"></div>
     </div>
 
-    <div class="card bg-secondary-subtle text-dark">
+    <div class="card bg-secondary-subtle text-dark mb-4">
       <div class="card-header">Mile Splits</div>
       <ul id="splits-list" class="list-group list-group-flush">
         <li class="list-group-item text-muted">No splits yet</li>
       </ul>
+    </div>
+
+    <div class="card bg-secondary-subtle text-dark">
+      <div class="card-header">Admin</div>
+      <div class="card-body">
+        <div class="row g-2 align-items-center">
+          <div class="col-12 col-sm-5">
+            <input type="password" id="admin-password" class="form-control" placeholder="Admin password">
+          </div>
+          <div class="col-6 col-sm-3">
+            <button id="admin-enable" class="btn btn-warning w-100">Enable Test Mode</button>
+          </div>
+          <div class="col-6 col-sm-3">
+            <button id="admin-disable" class="btn btn-outline-secondary w-100">Disable</button>
+          </div>
+        </div>
+        <div id="admin-status" class="small text-muted mt-2">Test mode status unknown until you submit the password.</div>
+      </div>
     </div>
   </div>
 
@@ -132,6 +150,33 @@
 
     refresh();
     setInterval(refresh, 3000);
+
+    async function setTestMode(enabled) {
+      const password = document.getElementById('admin-password').value;
+      const statusEl = document.getElementById('admin-status');
+      try {
+        const res = await fetch('/admin/test-mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password, enabled }),
+        });
+        if (res.status === 401) {
+          statusEl.textContent = 'Incorrect password.';
+          statusEl.className = 'small text-danger mt-2';
+          return;
+        }
+        const data = await res.json();
+        statusEl.textContent = 'Test mode is now ' + (data.discord_test_mode ? 'ON' : 'OFF') + '.';
+        statusEl.className = 'small mt-2 ' + (data.discord_test_mode ? 'text-warning' : 'text-success');
+      } catch (err) {
+        statusEl.textContent = 'Request failed - check the console.';
+        statusEl.className = 'small text-danger mt-2';
+        console.error('admin test-mode request failed', err);
+      }
+    }
+
+    document.getElementById('admin-enable').addEventListener('click', () => setTestMode(true));
+    document.getElementById('admin-disable').addEventListener('click', () => setTestMode(false));
   </script>
 </body>
 </html>
