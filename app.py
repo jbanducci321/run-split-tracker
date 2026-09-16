@@ -3,8 +3,9 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
+from discord_notifier import send_dm
 from split_tracker import RunTracker, parse_timestamp
 
 load_dotenv()
@@ -17,6 +18,7 @@ app = Flask(__name__)
 OVERLAND_ACCESS_TOKEN = os.environ.get("OVERLAND_ACCESS_TOKEN", "")
 
 tracker = RunTracker()
+last_summary = None  # most recently finished trip, kept until a new one starts
 
 
 def is_authorized(auth_header: str) -> bool:
@@ -24,13 +26,27 @@ def is_authorized(auth_header: str) -> bool:
     return bool(OVERLAND_ACCESS_TOKEN) and hmac.compare_digest(auth_header, expected)
 
 
-@app.get("/")
+@app.get("/health")
 def health():
     return jsonify(status="ok")
 
 
+@app.get("/")
+def dashboard():
+    return render_template("index.html")
+
+
+@app.get("/status")
+def status():
+    if tracker.active:
+        return jsonify(tracker.current_stats())
+    return jsonify(last_summary or tracker.current_stats())
+
+
 @app.post("/overland")
 def receive_overland_batch():
+    global last_summary
+
     if not is_authorized(request.headers.get("Authorization", "")):
         return jsonify(error="unauthorized"), 401
 
@@ -40,8 +56,12 @@ def receive_overland_batch():
 
     if not trip_active:
         if tracker.active:
-            summary = tracker.end()
-            logger.info("Trip ended. Splits recorded: %s", [s["pace_display"] for s in summary])
+            last_summary = tracker.end()
+            logger.info(
+                "Trip ended. Distance=%.2fmi Splits=%s",
+                last_summary["distance_miles"],
+                [s["pace_display"] for s in last_summary["splits"]],
+            )
         return jsonify(result="ok")
 
     points = []
@@ -62,12 +82,17 @@ def receive_overland_batch():
         if split:
             logger.info("MILE %d SPLIT: %s", split["mile"], split["pace_display"])
 
-    if points:
-        remaining = tracker.next_split_mile * 1609.344 - tracker.cumulative_meters
+    if points and tracker.last_speed_mps is not None:
+        stats = tracker.current_stats()
         logger.info(
-            "progress: %.0fm total, %.0fm to mile %d",
-            tracker.cumulative_meters, max(remaining, 0), tracker.next_split_mile,
+            "progress: %.2fmi total, current pace %s",
+            stats["distance_miles"], stats["current_pace_display"],
         )
+        # Test hook: DM on every update so we can confirm the Discord wiring
+        # works end-to-end. This is deliberately noisy - once confirmed, swap
+        # this for a call inside the `if split:` block above so it only fires
+        # on real mile crossings instead of every few seconds.
+        send_dm(f"Current pace: {stats['current_pace_display']} | {stats['distance_miles']:.2f} mi so far")
 
     return jsonify(result="ok")
 
