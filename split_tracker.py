@@ -3,6 +3,7 @@ from collections import deque
 from datetime import datetime
 
 MILE_METERS = 1609.344
+CHECKPOINT_METERS = MILE_METERS / 2  # report every half mile: halfway pace, then full-mile split
 
 # Points less precise than this (meters) are dropped rather than trusted.
 MAX_ACCURACY_METERS = 25
@@ -69,6 +70,7 @@ class RunTracker:
         self.cumulative_meters = 0.0
         self.last_speed_mps = None
         self.next_split_mile = 1
+        self.next_checkpoint_meters = CHECKPOINT_METERS
         self.splits = []
 
     def current_stats(self):
@@ -138,24 +140,37 @@ class RunTracker:
         self.last_smoothed_point = (smoothed_lat, smoothed_lon)
         self.path.append((smoothed_lat, smoothed_lon))
 
-        target_meters = self.next_split_mile * MILE_METERS
-        if self.cumulative_meters < target_meters or distance <= 0:
+        if self.cumulative_meters < self.next_checkpoint_meters or distance <= 0:
             return None
 
-        # Interpolate exactly where along this segment the mile boundary
-        # fell, instead of crediting the whole split to whenever this
-        # particular ping happened to arrive.
-        fraction = (target_meters - distance_before) / distance
+        # Interpolate exactly where along this segment the checkpoint fell,
+        # instead of crediting it to whenever this particular ping arrived.
+        fraction = (self.next_checkpoint_meters - distance_before) / distance
         crossing_time = prev_time + (timestamp - prev_time) * fraction
-        split_start = self.splits[-1]["crossing_time"] if self.splits else self.start_time
-        split_seconds = (crossing_time - split_start).total_seconds()
+        checkpoint_miles = self.next_checkpoint_meters / MILE_METERS
+        is_full_mile = round(checkpoint_miles * 2) % 2 == 0
+        self.next_checkpoint_meters += CHECKPOINT_METERS
 
-        split = {
-            "mile": self.next_split_mile,
-            "pace_seconds": split_seconds,
-            "pace_display": format_pace(split_seconds),
+        if is_full_mile:
+            split_start = self.splits[-1]["crossing_time"] if self.splits else self.start_time
+            split_seconds = (crossing_time - split_start).total_seconds()
+            event = {
+                "type": "split",
+                "mile": self.next_split_mile,
+                "pace_seconds": split_seconds,
+                "pace_display": format_pace(split_seconds),
+                "crossing_time": crossing_time,
+            }
+            self.splits.append(event)
+            self.next_split_mile += 1
+            return event
+
+        # Halfway through the current mile - report instantaneous pace only,
+        # this isn't a recorded split and doesn't affect split timing math.
+        current_pace_seconds = MILE_METERS / self.last_speed_mps if self.last_speed_mps else None
+        return {
+            "type": "halfway",
+            "mile": checkpoint_miles,
+            "pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "crossing_time": crossing_time,
         }
-        self.splits.append(split)
-        self.next_split_mile += 1
-        return split

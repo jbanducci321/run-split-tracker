@@ -78,9 +78,16 @@ def receive_overland_batch():
     points.sort(key=lambda p: p[2])
 
     for lat, lon, timestamp, accuracy in points:
-        split = tracker.process_point(lat, lon, timestamp, accuracy)
-        if split:
-            logger.info("MILE %d SPLIT: %s", split["mile"], split["pace_display"])
+        event = tracker.process_point(lat, lon, timestamp, accuracy)
+        if not event:
+            continue
+
+        if event["type"] == "split":
+            logger.info("MILE %d SPLIT: %s", event["mile"], event["pace_display"])
+            send_dm(f"Mile {event['mile']} - Pace: {event['pace_display']}")
+        elif event["pace_display"]:
+            logger.info("Halfway checkpoint at mile %.1f: %s", event["mile"], event["pace_display"])
+            send_dm(f"Pace: {event['pace_display']}")
 
     if points and tracker.last_speed_mps is not None:
         stats = tracker.current_stats()
@@ -88,11 +95,6 @@ def receive_overland_batch():
             "progress: %.2fmi total, current pace %s",
             stats["distance_miles"], stats["current_pace_display"],
         )
-        # Test hook: DM on every update so we can confirm the Discord wiring
-        # works end-to-end. This is deliberately noisy - once confirmed, swap
-        # this for a call inside the `if split:` block above so it only fires
-        # on real mile crossings instead of every few seconds.
-        send_dm(f"Current pace: {stats['current_pace_display']} | {stats['distance_miles']:.2f} mi so far")
 
     return jsonify(result="ok")
 

@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Run Split Tracker</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    #map { height: 320px; width: 100%; border-radius: 0.375rem; background: #444; }
+  </style>
 </head>
 <body class="bg-dark text-light">
   <div class="container py-5">
@@ -48,6 +52,11 @@
       </div>
     </div>
 
+    <div class="card bg-secondary-subtle text-dark mb-4">
+      <div class="card-header">Route</div>
+      <div id="map"></div>
+    </div>
+
     <div class="card bg-secondary-subtle text-dark">
       <div class="card-header">Mile Splits</div>
       <ul id="splits-list" class="list-group list-group-flush">
@@ -56,7 +65,39 @@
     </div>
   </div>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
+    const map = L.map('map').setView([0, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 19,
+    }).addTo(map);
+
+    let routeLine = L.polyline([], { color: '#0d6efd', weight: 4 }).addTo(map);
+    let currentMarker = null;
+    let mapCentered = false;
+
+    function updateMap(path) {
+      if (!path || !path.length) return;
+
+      const latLngs = path.map(p => [p[0], p[1]]);
+      routeLine.setLatLngs(latLngs);
+
+      const last = latLngs[latLngs.length - 1];
+      if (!currentMarker) {
+        currentMarker = L.circleMarker(last, { radius: 7, color: '#dc3545', fillOpacity: 1 }).addTo(map);
+      } else {
+        currentMarker.setLatLng(last);
+      }
+
+      if (!mapCentered) {
+        map.setView(last, 16);
+        mapCentered = true;
+      } else {
+        map.panTo(last);
+      }
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/status');
@@ -71,6 +112,8 @@
         document.getElementById('stat-elapsed').textContent = data.elapsed_display || '-';
         document.getElementById('stat-avg-pace').textContent = data.average_pace_display || '-';
         document.getElementById('stat-current-pace').textContent = data.current_pace_display || '-';
+
+        updateMap(data.path);
 
         const list = document.getElementById('splits-list');
         if (data.splits && data.splits.length) {
