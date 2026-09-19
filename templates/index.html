@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <style>
     #map { height: 320px; width: 100%; border-radius: 0.375rem; background: #444; }
+    #splits-list { max-height: 260px; overflow-y: auto; }
   </style>
 </head>
 <body class="bg-dark text-light">
@@ -52,6 +53,18 @@
       </div>
     </div>
 
+    <div id="goal-card" class="card bg-secondary-subtle text-dark mb-4" hidden>
+      <div class="card-body">
+        <div class="d-flex justify-content-between small text-muted mb-1">
+          <span id="goal-label">Goal</span>
+          <span id="goal-eta"></span>
+        </div>
+        <div class="progress" role="progressbar" aria-label="Goal progress">
+          <div id="goal-progress-bar" class="progress-bar bg-success" style="width: 0%"></div>
+        </div>
+      </div>
+    </div>
+
     <div class="card bg-secondary-subtle text-dark mb-4">
       <div class="card-header">Route</div>
       <div id="map"></div>
@@ -64,21 +77,44 @@
       </ul>
     </div>
 
-    <div class="card bg-secondary-subtle text-dark">
-      <div class="card-header">Admin</div>
-      <div class="card-body">
-        <div class="row g-2 align-items-center">
-          <div class="col-12 col-sm-5">
+    <div>
+      <button id="admin-login-btn" class="btn btn-sm btn-outline-secondary">Admin Login</button>
+
+      <div id="admin-login-box" class="card bg-secondary-subtle text-dark mt-2" style="max-width: 360px;" hidden>
+        <div class="card-body">
+          <div class="input-group">
             <input type="password" id="admin-password" class="form-control" placeholder="Admin password">
+            <button id="admin-login-submit" class="btn btn-primary">Unlock</button>
           </div>
-          <div class="col-6 col-sm-3">
-            <button id="admin-enable" class="btn btn-warning w-100">Enable Test Mode</button>
-          </div>
-          <div class="col-6 col-sm-3">
-            <button id="admin-disable" class="btn btn-outline-secondary w-100">Disable</button>
-          </div>
+          <div id="admin-login-error" class="small text-danger mt-2"></div>
         </div>
-        <div id="admin-status" class="small text-muted mt-2">Test mode status unknown until you submit the password.</div>
+      </div>
+
+      <div id="admin-panel" class="card bg-secondary-subtle text-dark mt-2" hidden>
+        <div class="card-header d-flex justify-content-between align-items-center">
+          Admin
+          <button id="admin-lock-btn" class="btn btn-sm btn-outline-secondary">Lock</button>
+        </div>
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="form-label small text-muted">Test mode (DM every few seconds instead of at real checkpoints)</label>
+            <div>
+              <button id="admin-enable" class="btn btn-warning btn-sm">Enable Test Mode</button>
+              <button id="admin-disable" class="btn btn-outline-secondary btn-sm">Disable</button>
+            </div>
+          </div>
+          <div>
+            <label for="admin-goal-input" class="form-label small text-muted">
+              Goal distance (miles, 0.01-99.99)
+            </label>
+            <div class="input-group" style="max-width: 320px;">
+              <input type="number" id="admin-goal-input" class="form-control" step="0.01" min="0.01" max="99.99" placeholder="e.g. 13.1">
+              <button id="admin-goal-set" class="btn btn-primary">Set</button>
+              <button id="admin-goal-clear" class="btn btn-outline-secondary">Clear</button>
+            </div>
+          </div>
+          <div id="admin-status" class="small text-muted mt-3"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -116,6 +152,19 @@
       }
     }
 
+    function updateGoal(data) {
+      const card = document.getElementById('goal-card');
+      if (!data.goal_distance_miles) {
+        card.hidden = true;
+        return;
+      }
+      card.hidden = false;
+      document.getElementById('goal-label').textContent =
+        `Goal: ${(data.distance_miles ?? 0).toFixed(2)} / ${data.goal_distance_miles.toFixed(2)} mi`;
+      document.getElementById('goal-eta').textContent = data.eta_display ? `ETA: ${data.eta_display}` : '';
+      document.getElementById('goal-progress-bar').style.width = (data.goal_progress_percent ?? 0) + '%';
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/status');
@@ -132,13 +181,14 @@
         document.getElementById('stat-current-pace').textContent = data.current_pace_display || '-';
 
         updateMap(data.path);
+        updateGoal(data);
 
         const list = document.getElementById('splits-list');
         if (data.splits && data.splits.length) {
           list.innerHTML = data.splits
-            .map(s => `<li class="list-group-item d-flex justify-content-between">
-                          <span>Mile ${s.mile}</span><span>${s.pace_display}</span>
-                        </li>`)
+            .slice()
+            .reverse()
+            .map(s => `<li class="list-group-item">Mile ${s.mile}: ${s.pace_display}</li>`)
             .join('');
         } else {
           list.innerHTML = '<li class="list-group-item text-muted">No splits yet</li>';
@@ -151,32 +201,124 @@
     refresh();
     setInterval(refresh, 3000);
 
-    async function setTestMode(enabled) {
-      const password = document.getElementById('admin-password').value;
-      const statusEl = document.getElementById('admin-status');
+    // --- Admin panel: fully hidden and inert until the correct password is
+    // entered. This is a UX gate, not the real security boundary - the
+    // server checks the password on every /admin/settings request no matter
+    // what the page shows or hides.
+    let adminPassword = sessionStorage.getItem('adminPassword') || '';
+
+    function showLoggedIn() {
+      document.getElementById('admin-login-btn').hidden = true;
+      document.getElementById('admin-login-box').hidden = true;
+      document.getElementById('admin-panel').hidden = false;
+    }
+
+    function showLoggedOut() {
+      adminPassword = '';
+      sessionStorage.removeItem('adminPassword');
+      document.getElementById('admin-login-btn').hidden = false;
+      document.getElementById('admin-login-box').hidden = true;
+      document.getElementById('admin-panel').hidden = true;
+    }
+
+    async function callAdminSettings(extra) {
+      const res = await fetch('/admin/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: adminPassword, ...extra }),
+      });
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, data };
+    }
+
+    document.getElementById('admin-login-btn').addEventListener('click', () => {
+      document.getElementById('admin-login-box').hidden = false;
+    });
+
+    document.getElementById('admin-login-submit').addEventListener('click', async () => {
+      const entered = document.getElementById('admin-password').value;
+      const errEl = document.getElementById('admin-login-error');
+      adminPassword = entered;
       try {
-        const res = await fetch('/admin/test-mode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password, enabled }),
-        });
-        if (res.status === 401) {
-          statusEl.textContent = 'Incorrect password.';
-          statusEl.className = 'small text-danger mt-2';
+        const { ok, status, data } = await callAdminSettings({});
+        if (!ok) {
+          errEl.textContent = status === 401 ? 'Incorrect password.' : (data.error || 'Login failed.');
+          adminPassword = '';
           return;
         }
-        const data = await res.json();
+        sessionStorage.setItem('adminPassword', entered);
+        errEl.textContent = '';
+        document.getElementById('admin-goal-input').value = data.goal_distance_miles ?? '';
+        showLoggedIn();
+      } catch (err) {
+        errEl.textContent = 'Request failed - check the console.';
+        console.error('admin login failed', err);
+      }
+    });
+
+    document.getElementById('admin-lock-btn').addEventListener('click', showLoggedOut);
+
+    async function setTestMode(enabled) {
+      const statusEl = document.getElementById('admin-status');
+      try {
+        const { ok, status, data } = await callAdminSettings({ discord_test_mode: enabled });
+        if (!ok) {
+          if (status === 401) showLoggedOut();
+          statusEl.textContent = data.error || 'Request failed.';
+          statusEl.className = 'small text-danger mt-3';
+          return;
+        }
         statusEl.textContent = 'Test mode is now ' + (data.discord_test_mode ? 'ON' : 'OFF') + '.';
-        statusEl.className = 'small mt-2 ' + (data.discord_test_mode ? 'text-warning' : 'text-success');
+        statusEl.className = 'small mt-3 ' + (data.discord_test_mode ? 'text-warning' : 'text-success');
       } catch (err) {
         statusEl.textContent = 'Request failed - check the console.';
-        statusEl.className = 'small text-danger mt-2';
+        statusEl.className = 'small text-danger mt-3';
         console.error('admin test-mode request failed', err);
+      }
+    }
+
+    async function setGoal(value) {
+      const statusEl = document.getElementById('admin-status');
+      try {
+        const { ok, status, data } = await callAdminSettings({ goal_distance_miles: value });
+        if (!ok) {
+          if (status === 401) showLoggedOut();
+          statusEl.textContent = data.error || 'Request failed.';
+          statusEl.className = 'small text-danger mt-3';
+          return;
+        }
+        statusEl.textContent = data.goal_distance_miles
+          ? `Goal set to ${data.goal_distance_miles.toFixed(2)} mi.`
+          : 'Goal cleared.';
+        statusEl.className = 'small mt-3 text-success';
+        document.getElementById('admin-goal-input').value = data.goal_distance_miles ?? '';
+      } catch (err) {
+        statusEl.textContent = 'Request failed - check the console.';
+        statusEl.className = 'small text-danger mt-3';
+        console.error('admin goal request failed', err);
       }
     }
 
     document.getElementById('admin-enable').addEventListener('click', () => setTestMode(true));
     document.getElementById('admin-disable').addEventListener('click', () => setTestMode(false));
+    document.getElementById('admin-goal-set').addEventListener('click', () => {
+      const val = document.getElementById('admin-goal-input').value;
+      setGoal(val === '' ? null : Number(val));
+    });
+    document.getElementById('admin-goal-clear').addEventListener('click', () => setGoal(null));
+
+    // If a password was already unlocked earlier this browser session, skip
+    // straight to the panel instead of prompting again.
+    if (adminPassword) {
+      callAdminSettings({}).then(({ ok, data }) => {
+        if (ok) {
+          document.getElementById('admin-goal-input').value = data.goal_distance_miles ?? '';
+          showLoggedIn();
+        } else {
+          showLoggedOut();
+        }
+      });
+    }
   </script>
 </body>
 </html>

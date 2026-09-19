@@ -72,6 +72,7 @@ class RunTracker:
         self.next_split_mile = 1
         self.next_checkpoint_meters = CHECKPOINT_METERS
         self.splits = []
+        self.goal_notified = False  # per-trip flag, set by app.py once a goal distance is announced
 
     def current_stats(self):
         distance_miles = self.cumulative_meters / MILE_METERS
@@ -165,12 +166,11 @@ class RunTracker:
             self.next_split_mile += 1
             return event
 
-        # Halfway through the current mile - report instantaneous pace only,
-        # this isn't a recorded split and doesn't affect split timing math.
-        current_pace_seconds = MILE_METERS / self.last_speed_mps if self.last_speed_mps else None
+        # Halfway through the current mile - the caller decides what to report
+        # (whole-trip average pace, per app.py) - this isn't a recorded split
+        # and doesn't affect split timing math.
         return {
             "type": "halfway",
             "mile": checkpoint_miles,
-            "pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "crossing_time": crossing_time,
         }
