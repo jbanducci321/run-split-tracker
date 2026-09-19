@@ -98,6 +98,22 @@ def status():
     return jsonify(build_status_payload(stats))
 
 
+@app.post("/admin/reset")
+def admin_reset():
+    global last_summary, last_test_dm_time
+
+    data = request.get_json(silent=True) or {}
+    if not is_admin_password_correct(data.get("password", "")):
+        return jsonify(error="unauthorized"), 401
+
+    # Clears the current/last run's location data only - goal distance and
+    # test mode stay as you set them, since those are settings, not run data.
+    tracker.reset()
+    last_summary = None
+    last_test_dm_time = None
+    return jsonify(result="ok")
+
+
 @app.post("/admin/settings")
 def admin_settings():
     data = request.get_json(silent=True) or {}

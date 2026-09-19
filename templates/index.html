@@ -9,45 +9,51 @@
   <style>
     #map { height: 320px; width: 100%; border-radius: 0.375rem; background: #444; }
     #splits-list { max-height: 260px; overflow-y: auto; }
+    .stat-value { font-size: clamp(1.05rem, 5vw, 1.5rem); }
+
+    @media (max-width: 400px) {
+      #map { height: 240px; }
+      .stat-card .card-body { padding: 0.65rem 0.4rem; }
+    }
   </style>
 </head>
 <body class="bg-dark text-light">
-  <div class="container py-5">
-    <div class="d-flex justify-content-between align-items-center mb-4">
+  <div class="container py-3 py-md-5">
+    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
       <h1 class="h3 mb-0">Run Split Tracker</h1>
       <span id="status-badge" class="badge bg-secondary fs-6">Loading...</span>
     </div>
 
-    <div class="row g-3 mb-4">
+    <div class="row g-2 g-md-3 mb-4">
       <div class="col-6 col-md-3">
-        <div class="card bg-secondary-subtle text-dark h-100">
+        <div class="card stat-card bg-secondary-subtle text-dark h-100">
           <div class="card-body text-center">
             <div class="text-muted small">Distance</div>
-            <div id="stat-distance" class="fs-4 fw-bold">-</div>
+            <div id="stat-distance" class="stat-value fw-bold">-</div>
           </div>
         </div>
       </div>
       <div class="col-6 col-md-3">
-        <div class="card bg-secondary-subtle text-dark h-100">
+        <div class="card stat-card bg-secondary-subtle text-dark h-100">
           <div class="card-body text-center">
             <div class="text-muted small">Elapsed</div>
-            <div id="stat-elapsed" class="fs-4 fw-bold">-</div>
+            <div id="stat-elapsed" class="stat-value fw-bold">-</div>
           </div>
         </div>
       </div>
       <div class="col-6 col-md-3">
-        <div class="card bg-secondary-subtle text-dark h-100">
+        <div class="card stat-card bg-secondary-subtle text-dark h-100">
           <div class="card-body text-center">
             <div class="text-muted small">Average Pace</div>
-            <div id="stat-avg-pace" class="fs-4 fw-bold">-</div>
+            <div id="stat-avg-pace" class="stat-value fw-bold">-</div>
           </div>
         </div>
       </div>
       <div class="col-6 col-md-3">
-        <div class="card bg-secondary-subtle text-dark h-100">
+        <div class="card stat-card bg-secondary-subtle text-dark h-100">
           <div class="card-body text-center">
             <div class="text-muted small">Current Pace</div>
-            <div id="stat-current-pace" class="fs-4 fw-bold">-</div>
+            <div id="stat-current-pace" class="stat-value fw-bold">-</div>
           </div>
         </div>
       </div>
@@ -55,7 +61,7 @@
 
     <div id="goal-card" class="card bg-secondary-subtle text-dark mb-4" hidden>
       <div class="card-body">
-        <div class="d-flex justify-content-between small text-muted mb-1">
+        <div class="d-flex justify-content-between small text-muted mb-1 flex-wrap gap-1">
           <span id="goal-label">Goal</span>
           <span id="goal-eta"></span>
         </div>
@@ -107,11 +113,19 @@
             <label for="admin-goal-input" class="form-label small text-muted">
               Goal distance (miles, 0.01-99.99)
             </label>
-            <div class="input-group" style="max-width: 320px;">
+            <div class="input-group" style="max-width: 100%; width: 320px;">
               <input type="number" id="admin-goal-input" class="form-control" step="0.01" min="0.01" max="99.99" placeholder="e.g. 13.1">
               <button id="admin-goal-set" class="btn btn-primary">Set</button>
               <button id="admin-goal-clear" class="btn btn-outline-secondary">Clear</button>
             </div>
+          </div>
+          <hr>
+          <div>
+            <label class="form-label small text-muted">Danger zone</label>
+            <div>
+              <button id="admin-reset" class="btn btn-danger btn-sm">Reset Run Data</button>
+            </div>
+            <div class="small text-muted mt-1">Clears the map, splits, and stats back to a blank state. Does not touch your goal distance or test mode setting.</div>
           </div>
           <div id="admin-status" class="small text-muted mt-3"></div>
         </div>
@@ -132,7 +146,15 @@
     let mapCentered = false;
 
     function updateMap(path) {
-      if (!path || !path.length) return;
+      if (!path || !path.length) {
+        routeLine.setLatLngs([]);
+        if (currentMarker) {
+          map.removeLayer(currentMarker);
+          currentMarker = null;
+        }
+        mapCentered = false;
+        return;
+      }
 
       const latLngs = path.map(p => [p[0], p[1]]);
       routeLine.setLatLngs(latLngs);
@@ -299,6 +321,33 @@
       }
     }
 
+    async function resetRunData() {
+      const statusEl = document.getElementById('admin-status');
+      if (!confirm('Clear the current map, splits, and stats? This cannot be undone.')) return;
+
+      try {
+        const res = await fetch('/admin/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: adminPassword }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (res.status === 401) showLoggedOut();
+          statusEl.textContent = data.error || 'Request failed.';
+          statusEl.className = 'small text-danger mt-3';
+          return;
+        }
+        statusEl.textContent = 'Run data reset.';
+        statusEl.className = 'small mt-3 text-success';
+        refresh();
+      } catch (err) {
+        statusEl.textContent = 'Request failed - check the console.';
+        statusEl.className = 'small text-danger mt-3';
+        console.error('admin reset request failed', err);
+      }
+    }
+
     document.getElementById('admin-enable').addEventListener('click', () => setTestMode(true));
     document.getElementById('admin-disable').addEventListener('click', () => setTestMode(false));
     document.getElementById('admin-goal-set').addEventListener('click', () => {
@@ -306,6 +355,7 @@
       setGoal(val === '' ? null : Number(val));
     });
     document.getElementById('admin-goal-clear').addEventListener('click', () => setGoal(null));
+    document.getElementById('admin-reset').addEventListener('click', resetRunData);
 
     // If a password was already unlocked earlier this browser session, skip
     // straight to the panel instead of prompting again.
