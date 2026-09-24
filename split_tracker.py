@@ -84,7 +84,8 @@ class RunTracker:
         self.next_split_mile = 1
         self.next_checkpoint_meters = CHECKPOINT_METERS
         self.splits = []
-        self.goal_notified = False  # per-trip flag, set by app.py once a goal distance is announced
+        self.goal_notified = False  # per-trip flags, set by app.py once each goal DM is sent
+        self.goal_half_notified = False
 
     def current_stats(self):
         distance_miles = self.cumulative_meters / MILE_METERS
@@ -95,6 +96,19 @@ class RunTracker:
         average_pace_seconds = elapsed_seconds / distance_miles if distance_miles > 0.01 else None
         current_pace_seconds = MILE_METERS / self.last_speed_mps if self.last_speed_mps else None
 
+        # Distance/pace since the last completed mile - Strava's trailing
+        # partial split. Mile boundaries land exactly on whole-mile marks, so
+        # the last split's distance is just the completed mile count.
+        partial_distance_miles = distance_miles - (self.next_split_mile - 1)
+        partial_start = self.splits[-1]["crossing_time"] if self.splits else self.start_time
+        partial_elapsed = (
+            (self.last_seen_time - partial_start).total_seconds()
+            if partial_start and self.last_seen_time else 0
+        )
+        partial_pace_seconds = partial_elapsed / partial_distance_miles if partial_distance_miles > 0.02 else None
+
+        fastest = min(self.splits, key=lambda s: s["pace_seconds"]) if self.splits else None
+
         return {
             "active": self.active,
             "distance_miles": round(distance_miles, 3),
@@ -102,13 +116,24 @@ class RunTracker:
             "elapsed_display": format_duration(elapsed_seconds),
             "average_pace_display": format_pace(average_pace_seconds) if average_pace_seconds else None,
             "current_pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
-            "splits": [{"mile": s["mile"], "pace_display": s["pace_display"]} for s in self.splits],
+            "splits": [
+                {"mile": s["mile"], "pace_seconds": round(s["pace_seconds"], 1), "pace_display": s["pace_display"]}
+                for s in self.splits
+            ],
+            "fastest_split": {"mile": fastest["mile"], "pace_display": fastest["pace_display"]} if fastest else None,
+            "partial_split": {
+                "distance_miles": round(partial_distance_miles, 2),
+                "pace_display": format_pace(partial_pace_seconds),
+            } if partial_pace_seconds else None,
             "path": [[lat, lon] for lat, lon in self.path],
         }
 
     def end(self):
         summary = self.current_stats()
         summary["active"] = False
+        # Instantaneous pace of the last few steps (usually slowing to a stop)
+        # is meaningless once the run is over.
+        summary["current_pace_display"] = None
         self.reset()
         return summary
 

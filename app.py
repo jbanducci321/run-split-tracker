@@ -193,7 +193,13 @@ def receive_overland_batch():
                     send_dm(f"Pace: {avg_pace}")
 
         goal = admin_state["goal_distance_miles"]
-        if goal and not tracker.goal_notified and tracker.cumulative_meters / MILE_METERS >= goal:
+        distance_miles = tracker.cumulative_meters / MILE_METERS
+        if goal and not tracker.goal_half_notified and distance_miles >= goal / 2:
+            tracker.goal_half_notified = True
+            avg_pace = tracker.current_stats()["average_pace_display"]
+            logger.info("GOAL HALFWAY: %.2f / %.2f mi", goal / 2, goal)
+            send_dm(f"Halfway to goal! {goal / 2:.2f} / {goal:.2f} mi - Avg pace: {avg_pace}")
+        if goal and not tracker.goal_notified and distance_miles >= goal:
             tracker.goal_notified = True
             logger.info("GOAL REACHED: %.2f mi", goal)
             send_dm(f"Goal reached! {goal:.2f} mi")
