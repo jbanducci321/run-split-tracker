@@ -74,9 +74,9 @@ def build_status_payload(stats):
         stats["goal_progress_percent"] = round(min(stats["distance_miles"] / goal, 1) * 100, 1)
 
         remaining_miles = goal - stats["distance_miles"]
-        elapsed = stats["elapsed_seconds"] or 0
-        if remaining_miles > 0 and stats["distance_miles"] > 0.01 and elapsed > 0:
-            average_pace_seconds = elapsed / stats["distance_miles"]
+        moving = stats["moving_seconds"] or 0
+        if remaining_miles > 0 and stats["distance_miles"] > 0.01 and moving > 0:
+            average_pace_seconds = moving / stats["distance_miles"]
             stats["eta_display"] = format_duration(remaining_miles * average_pace_seconds)
 
     return stats
@@ -165,23 +165,26 @@ def receive_overland_batch():
         lon, lat = feature.get("geometry", {}).get("coordinates", [None, None])
         if lat is None or lon is None:
             continue
-        points.append((lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy")))
+        points.append((
+            lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy"), props.get("speed"),
+        ))
 
     points.sort(key=lambda p: p[2])
 
-    for lat, lon, timestamp, accuracy in points:
-        event = tracker.process_point(lat, lon, timestamp, accuracy)
+    for lat, lon, timestamp, accuracy, speed in points:
+        event = tracker.process_point(lat, lon, timestamp, accuracy, speed)
 
         if admin_state["discord_test_mode"]:
             due = (
                 last_test_dm_time is None
                 or (timestamp - last_test_dm_time).total_seconds() >= TEST_MODE_INTERVAL_SECONDS
             )
-            if tracker.last_speed_mps is not None and due:
-                pace = tracker.current_stats()["current_pace_display"]
-                logger.info("TEST MODE update: %s", pace)
-                send_dm(f"Pace: {pace}")
-                last_test_dm_time = timestamp
+            if due:
+                pace = tracker.current_stats()["current_pace_display"]  # None while paused
+                if pace:
+                    logger.info("TEST MODE update: %s", pace)
+                    send_dm(f"Pace: {pace}")
+                    last_test_dm_time = timestamp
         elif event:
             if event["type"] == "split":
                 logger.info("MILE %d SPLIT: %s", event["mile"], event["pace_display"])
@@ -207,8 +210,9 @@ def receive_overland_batch():
     if points and tracker.last_speed_mps is not None:
         stats = tracker.current_stats()
         logger.info(
-            "progress: %.2fmi total, current pace %s",
-            stats["distance_miles"], stats["current_pace_display"],
+            "progress: %.2fmi total, moving %s, current pace %s",
+            stats["distance_miles"], stats["moving_display"],
+            "PAUSED" if stats["paused"] else stats["current_pace_display"],
         )
 
     return jsonify(result="ok")

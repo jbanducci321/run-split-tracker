@@ -29,6 +29,17 @@ SMOOTHING_WINDOW = 3
 # of that range. Re-tune if the reporting interval changes.
 MIN_MOVEMENT_METERS = 5.0
 
+# Auto-pause, like Strava's: if the distance anchor hasn't advanced for longer
+# than this, you've stopped (crosswalk, water break) and that time is left
+# out of moving time. At a 5s reporting interval, even a slow walk advances
+# the anchor every ~5s, so 10s only trips on a real stop.
+PAUSE_AFTER_SECONDS = 10
+
+# The phone's own speed reading (GPS doppler, m/s) below which you're treated
+# as standing still. More reliable than position at a stop, where a few
+# meters of GPS wobble can otherwise look like movement.
+STATIONARY_SPEED_MPS = 0.5
+
 
 def haversine_meters(lat1, lon1, lat2, lon2):
     r = 6371000
@@ -81,6 +92,8 @@ class RunTracker:
         self.distance_anchor = None  # (lat, lon, timestamp) - raw point distance is measured from
         self.cumulative_meters = 0.0
         self.last_speed_mps = None
+        self.moving_seconds = 0.0  # moving time up to the current distance anchor
+        self.moving_speed_mps = None  # speed of the last un-paused segment
         self.next_split_mile = 1
         self.next_checkpoint_meters = CHECKPOINT_METERS
         self.splits = []
@@ -93,27 +106,38 @@ class RunTracker:
             (self.last_seen_time - self.start_time).total_seconds()
             if self.start_time and self.last_seen_time else 0
         )
-        average_pace_seconds = elapsed_seconds / distance_miles if distance_miles > 0.01 else None
-        current_pace_seconds = MILE_METERS / self.last_speed_mps if self.last_speed_mps else None
+        # Time since the last confirmed movement counts as moving until it
+        # passes the auto-pause threshold.
+        paused = False
+        moving_seconds = self.moving_seconds
+        if self.distance_anchor and self.last_seen_time:
+            since_anchor = (self.last_seen_time - self.distance_anchor[2]).total_seconds()
+            paused = self.active and since_anchor > PAUSE_AFTER_SECONDS
+            if not paused:
+                moving_seconds += since_anchor
+
+        average_pace_seconds = moving_seconds / distance_miles if distance_miles > 0.01 else None
+        current_pace_seconds = (
+            MILE_METERS / self.last_speed_mps if self.last_speed_mps and not paused else None
+        )
 
         # Distance/pace since the last completed mile - Strava's trailing
         # partial split. Mile boundaries land exactly on whole-mile marks, so
         # the last split's distance is just the completed mile count.
         partial_distance_miles = distance_miles - (self.next_split_mile - 1)
-        partial_start = self.splits[-1]["crossing_time"] if self.splits else self.start_time
-        partial_elapsed = (
-            (self.last_seen_time - partial_start).total_seconds()
-            if partial_start and self.last_seen_time else 0
-        )
-        partial_pace_seconds = partial_elapsed / partial_distance_miles if partial_distance_miles > 0.02 else None
+        partial_moving = moving_seconds - (self.splits[-1]["crossing_moving"] if self.splits else 0.0)
+        partial_pace_seconds = partial_moving / partial_distance_miles if partial_distance_miles > 0.02 else None
 
         fastest = min(self.splits, key=lambda s: s["pace_seconds"]) if self.splits else None
 
         return {
             "active": self.active,
+            "paused": paused,
             "distance_miles": round(distance_miles, 3),
             "elapsed_seconds": elapsed_seconds,
             "elapsed_display": format_duration(elapsed_seconds),
+            "moving_seconds": moving_seconds,
+            "moving_display": format_duration(moving_seconds),
             "average_pace_display": format_pace(average_pace_seconds) if average_pace_seconds else None,
             "current_pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "splits": [
@@ -131,13 +155,14 @@ class RunTracker:
     def end(self):
         summary = self.current_stats()
         summary["active"] = False
+        summary["paused"] = False
         # Instantaneous pace of the last few steps (usually slowing to a stop)
         # is meaningless once the run is over.
         summary["current_pace_display"] = None
         self.reset()
         return summary
 
-    def process_point(self, lat, lon, timestamp, accuracy):
+    def process_point(self, lat, lon, timestamp, accuracy, speed=None):
         if not self.active:
             self.reset()
             self.active = True
@@ -172,16 +197,31 @@ class RunTracker:
             self.distance_anchor = (lat, lon, timestamp)
             return None
 
+        # iOS reports -1 when speed is unknown, so only trust non-negative values.
+        if speed is not None and 0 <= speed < STATIONARY_SPEED_MPS:
+            return None  # phone says you're standing still - GPS wobble isn't distance
+
         anchor_lat, anchor_lon, anchor_time = self.distance_anchor
         distance = haversine_meters(anchor_lat, anchor_lon, lat, lon)
         if distance < MIN_MOVEMENT_METERS:
             return None  # not enough movement yet to be confident this is real, not jitter
 
         anchor_elapsed = (timestamp - anchor_time).total_seconds()
-        self.last_speed_mps = distance / anchor_elapsed
+        if anchor_elapsed <= PAUSE_AFTER_SECONDS:
+            moving_portion = anchor_elapsed
+            self.moving_speed_mps = distance / anchor_elapsed
+        elif self.moving_speed_mps:
+            # You stopped somewhere in this gap - only the time it would take
+            # to cover this distance at your recent pace counts as moving.
+            moving_portion = min(anchor_elapsed, distance / self.moving_speed_mps)
+        else:
+            moving_portion = PAUSE_AFTER_SECONDS  # stood still before your first real stride
+        self.last_speed_mps = distance / moving_portion
 
         distance_before = self.cumulative_meters
+        moving_before = self.moving_seconds
         self.cumulative_meters += distance
+        self.moving_seconds += moving_portion
         self.distance_anchor = (lat, lon, timestamp)
 
         if self.cumulative_meters < self.next_checkpoint_meters:
@@ -191,19 +231,23 @@ class RunTracker:
         # instead of crediting it to whenever this particular ping arrived.
         fraction = (self.next_checkpoint_meters - distance_before) / distance
         crossing_time = anchor_time + (timestamp - anchor_time) * fraction
+        crossing_moving = moving_before + moving_portion * fraction
         checkpoint_miles = self.next_checkpoint_meters / MILE_METERS
         is_full_mile = round(checkpoint_miles * 2) % 2 == 0
         self.next_checkpoint_meters += CHECKPOINT_METERS
 
         if is_full_mile:
-            split_start = self.splits[-1]["crossing_time"] if self.splits else self.start_time
-            split_seconds = (crossing_time - split_start).total_seconds()
+            # Split pace uses moving time, so a stop mid-mile doesn't count
+            # against that mile - matches how Strava reports splits.
+            split_start_moving = self.splits[-1]["crossing_moving"] if self.splits else 0.0
+            split_seconds = crossing_moving - split_start_moving
             event = {
                 "type": "split",
                 "mile": self.next_split_mile,
                 "pace_seconds": split_seconds,
                 "pace_display": format_pace(split_seconds),
                 "crossing_time": crossing_time,
+                "crossing_moving": crossing_moving,
             }
             self.splits.append(event)
             self.next_split_mile += 1

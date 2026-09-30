@@ -49,8 +49,9 @@
       <div class="col-6 col-md-3">
         <div class="card stat-card bg-secondary-subtle text-dark h-100">
           <div class="card-body text-center">
-            <div class="text-muted small">Elapsed</div>
-            <div id="stat-elapsed" class="stat-value fw-bold">-</div>
+            <div class="text-muted small">Moving Time</div>
+            <div id="stat-moving" class="stat-value fw-bold">-</div>
+            <div id="stat-elapsed" class="text-muted small"></div>
           </div>
         </div>
       </div>
@@ -356,18 +357,25 @@
         const data = await res.json();
 
         const badge = document.getElementById('status-badge');
-        badge.textContent = data.active ? 'Active' : 'No active trip';
-        badge.className = 'badge fs-6 ' + (data.active ? 'bg-success' : 'bg-secondary');
+        if (data.active && data.paused) {
+          badge.textContent = 'Paused';
+          badge.className = 'badge fs-6 bg-warning text-dark';
+        } else {
+          badge.textContent = data.active ? 'Active' : 'No active trip';
+          badge.className = 'badge fs-6 ' + (data.active ? 'bg-success' : 'bg-secondary');
+        }
 
         document.getElementById('stat-distance').textContent =
           (data.distance_miles ?? 0).toFixed(2) + ' mi';
-        document.getElementById('stat-elapsed').textContent = data.elapsed_display || '-';
+        document.getElementById('stat-moving').textContent = data.moving_display || '-';
+        document.getElementById('stat-elapsed').textContent =
+          data.elapsed_display && data.elapsed_display !== data.moving_display ? `Elapsed ${data.elapsed_display}` : '';
         document.getElementById('stat-avg-pace').textContent = data.average_pace_display || '-';
         const fourthLabel = document.getElementById('stat-fourth-label');
         const fourthValue = document.getElementById('stat-fourth-value');
         if (data.active) {
           fourthLabel.textContent = 'Current Pace';
-          fourthValue.textContent = data.current_pace_display || '-';
+          fourthValue.textContent = data.paused ? 'Paused' : (data.current_pace_display || '-');
         } else {
           fourthLabel.textContent = data.fastest_split ? `Fastest (Mile ${data.fastest_split.mile})` : 'Fastest Mile';
           fourthValue.textContent = data.fastest_split ? data.fastest_split.pace_display : '-';
