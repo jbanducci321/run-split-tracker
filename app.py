@@ -1,6 +1,7 @@
 import hmac
 import logging
 import os
+import threading
 import time
 from datetime import timezone
 
@@ -8,8 +9,11 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 
 import db
+import weather
 from discord_notifier import send_dm
-from split_tracker import ALGORITHM_VERSION, MILE_METERS, RunTracker, format_duration, parse_timestamp
+from split_tracker import (
+    ALGORITHM_VERSION, MILE_METERS, RunTracker, format_duration, format_pace, parse_timestamp,
+)
 
 load_dotenv()
 
@@ -36,6 +40,8 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 TEST_MODE_INTERVAL_SECONDS = int(os.environ.get("TEST_MODE_INTERVAL_SECONDS", "15"))
 
 MAX_GOAL_MILES = 99.99
+MIN_TARGET_PACE_SECONDS = 60             # 1:00/mi - the admin dropdowns offer 1-10 minutes, 0-59 seconds
+MAX_TARGET_PACE_SECONDS = 10 * 60 + 59   # 10:59/mi
 
 # Live, password-changeable settings. DISCORD_TEST_MODE env var is just the
 # startup default; the admin panel can flip these without a restart. Any
@@ -43,11 +49,56 @@ MAX_GOAL_MILES = 99.99
 admin_state = {
     "discord_test_mode": os.environ.get("DISCORD_TEST_MODE", "false").lower() == "true",
     "goal_distance_miles": None,
+    "target_pace_enabled": False,
+    "target_pace_seconds": None,  # kept while disabled, so toggling back on restores it
 }
 
 tracker = RunTracker()
 last_summary = None  # most recently finished trip, kept until a new one starts
 last_test_dm_time = None  # timestamp (from GPS data, not wall clock) of the last test-mode DM
+trip_announced = False  # whether this trip's "Tracking started" DM has gone out
+announce_thread = None
+
+
+def effective_target_pace():
+    return admin_state["target_pace_seconds"] if admin_state["target_pace_enabled"] else None
+
+
+def target_note(pace_seconds):
+    """' (8s faster than target)' style suffix for DMs, or '' with no target set."""
+    target = effective_target_pace()
+    if target is None or pace_seconds is None:
+        return ""
+    diff = round(pace_seconds - target)
+    if diff == 0:
+        return " (on target)"
+    gap = f"{abs(diff)}s" if abs(diff) < 60 else f"{abs(diff) // 60}:{abs(diff) % 60:02d}"
+    return f" ({gap} {'slower' if diff > 0 else 'faster'} than target)"
+
+
+def announce_trip_start(run_id, lat, lon, goal, target):
+    """Background: fetch start weather, send the 'Tracking started' DM, save the conditions."""
+    conditions = weather.fetch_current_conditions(lat, lon)
+    message = "Tracking started"
+    if conditions:
+        message += f" - {weather.describe(conditions)}"
+    if goal:
+        message += f". Goal: {goal:.2f} mi"
+    if target:
+        message += f". Target pace: {format_pace(target)}"
+    send_dm(message)
+    logger.info("Sent: %s", message)
+
+    if not (PERSISTENCE_ENABLED and conditions):
+        return
+    if run_id is None:
+        logger.warning("Weather: not saved - the run row wasn't created yet")
+        return
+    try:
+        db.save_conditions(run_id, conditions)
+        logger.info("DB: run %s start conditions saved", run_id)
+    except Exception:
+        logger.exception("DB: run %s start conditions couldn't be saved", run_id)
 
 # Database state for the trip in progress.
 recording = {"run_id": None, "buffer": [], "chunk_index": 0, "last_db_attempt": float("-inf")}
@@ -74,6 +125,7 @@ def ensure_run_recorded():
             to_utc_naive(tracker.start_time),
             int(offset.total_seconds() // 60) if offset else None,
             admin_state["goal_distance_miles"],
+            effective_target_pace(),
             admin_state["discord_test_mode"],
             ALGORITHM_VERSION,
         )
@@ -146,9 +198,19 @@ def validate_goal_distance(value):
     return rounded
 
 
+def validate_target_pace(value):
+    """Target pace in whole seconds per mile, 1:00-10:59, or raises ValueError."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("target pace must be a whole number of seconds")
+    if not MIN_TARGET_PACE_SECONDS <= value <= MAX_TARGET_PACE_SECONDS:
+        raise ValueError("target pace must be between 1:00 and 10:59 per mile")
+    return value
+
+
 def build_status_payload(stats):
     goal = admin_state["goal_distance_miles"]
     stats = dict(stats)
+    stats["target_pace_seconds"] = effective_target_pace()
     stats["goal_distance_miles"] = goal
     stats["goal_progress_percent"] = None
     stats["eta_display"] = None
@@ -183,7 +245,7 @@ def status():
 
 @app.post("/admin/reset")
 def admin_reset():
-    global last_summary, last_test_dm_time
+    global last_summary, last_test_dm_time, trip_announced
 
     data = request.get_json(silent=True) or {}
     if not is_admin_password_correct(data.get("password", "")):
@@ -203,6 +265,7 @@ def admin_reset():
     tracker.reset()
     last_summary = None
     last_test_dm_time = None
+    trip_announced = False
     return jsonify(result="ok")
 
 
@@ -212,24 +275,36 @@ def admin_settings():
     if not is_admin_password_correct(data.get("password", "")):
         return jsonify(error="unauthorized"), 401
 
-    if "discord_test_mode" in data:
-        admin_state["discord_test_mode"] = bool(data["discord_test_mode"])
-
-    if "goal_distance_miles" in data:
-        try:
-            admin_state["goal_distance_miles"] = validate_goal_distance(data["goal_distance_miles"])
-        except ValueError as exc:
-            return jsonify(error=str(exc)), 400
+    # Validate everything first so a bad value can't leave settings half-applied.
+    updates = {}
+    try:
+        if "discord_test_mode" in data:
+            updates["discord_test_mode"] = bool(data["discord_test_mode"])
+        if "goal_distance_miles" in data:
+            updates["goal_distance_miles"] = validate_goal_distance(data["goal_distance_miles"])
+        if "target_pace_seconds" in data:
+            updates["target_pace_seconds"] = validate_target_pace(data["target_pace_seconds"])
+        if "target_pace_enabled" in data:
+            updates["target_pace_enabled"] = bool(data["target_pace_enabled"])
+            if updates["target_pace_enabled"] and updates.get(
+                "target_pace_seconds", admin_state["target_pace_seconds"]
+            ) is None:
+                raise ValueError("pick a target pace before enabling it")
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    admin_state.update(updates)
 
     return jsonify(
         discord_test_mode=admin_state["discord_test_mode"],
         goal_distance_miles=admin_state["goal_distance_miles"],
+        target_pace_enabled=admin_state["target_pace_enabled"],
+        target_pace_seconds=admin_state["target_pace_seconds"],
     )
 
 
 @app.post("/overland")
 def receive_overland_batch():
-    global last_summary, last_test_dm_time
+    global last_summary, last_test_dm_time, trip_announced, announce_thread
 
     if not is_authorized(request.headers.get("Authorization", "")):
         return jsonify(error="unauthorized"), 401
@@ -240,6 +315,7 @@ def receive_overland_batch():
 
     if not trip_active:
         if tracker.active:
+            trip_announced = False
             ended_at, goal_reached = tracker.last_seen_time, tracker.goal_notified
             last_summary = tracker.end()
             logger.info(
@@ -278,28 +354,32 @@ def receive_overland_batch():
                 or (timestamp - last_test_dm_time).total_seconds() >= TEST_MODE_INTERVAL_SECONDS
             )
             if due:
-                pace = tracker.current_stats()["current_pace_display"]  # None while paused
+                stats = tracker.current_stats()
+                pace = stats["current_pace_display"]  # None while paused
                 if pace:
                     logger.info("TEST MODE update: %s", pace)
-                    send_dm(f"Pace: {pace}")
+                    send_dm(f"Pace: {pace}{target_note(stats['current_pace_seconds'])}")
                     last_test_dm_time = timestamp
         elif event:
             if event["type"] == "split":
                 logger.info("MILE %d SPLIT: %s", event["mile"], event["pace_display"])
-                send_dm(f"Mile {event['mile']} - Pace: {event['pace_display']}")
+                send_dm(f"Mile {event['mile']} - Pace: {event['pace_display']}{target_note(event['pace_seconds'])}")
             else:
-                avg_pace = tracker.current_stats()["average_pace_display"]
-                logger.info("Halfway checkpoint at mile %.1f: avg pace %s", event["mile"], avg_pace)
-                if avg_pace:
-                    send_dm(f"Pace: {avg_pace}")
+                stats = tracker.current_stats()
+                logger.info("Halfway checkpoint at mile %.1f: avg pace %s", event["mile"], stats["average_pace_display"])
+                if stats["average_pace_display"]:
+                    send_dm(f"Pace: {stats['average_pace_display']}{target_note(stats['average_pace_seconds'])}")
 
         goal = admin_state["goal_distance_miles"]
         distance_miles = tracker.cumulative_meters / MILE_METERS
         if goal and not tracker.goal_half_notified and distance_miles >= goal / 2:
             tracker.goal_half_notified = True
-            avg_pace = tracker.current_stats()["average_pace_display"]
+            stats = tracker.current_stats()
             logger.info("GOAL HALFWAY: %.2f / %.2f mi", goal / 2, goal)
-            send_dm(f"Halfway to goal! {goal / 2:.2f} / {goal:.2f} mi - Avg pace: {avg_pace}")
+            send_dm(
+                f"Halfway to goal! {goal / 2:.2f} / {goal:.2f} mi - Avg pace: {stats['average_pace_display']}"
+                f"{target_note(stats['average_pace_seconds'])}"
+            )
         if goal and not tracker.goal_notified and distance_miles >= goal:
             tracker.goal_notified = True
             logger.info("GOAL REACHED: %.2f mi", goal)
@@ -308,6 +388,18 @@ def receive_overland_batch():
     if PERSISTENCE_ENABLED and tracker.active:
         ensure_run_recorded()
         flush_points()
+
+    # First accepted point of a new trip: announce it (weather lookup runs in
+    # the background so it can't slow down Overland's request).
+    if tracker.active and not trip_announced and tracker.path:
+        trip_announced = True
+        start_lat, start_lon = tracker.path[0]
+        announce_thread = threading.Thread(
+            target=announce_trip_start,
+            args=(recording["run_id"], start_lat, start_lon, admin_state["goal_distance_miles"], effective_target_pace()),
+            daemon=True,
+        )
+        announce_thread.start()
 
     if points and tracker.last_speed_mps is not None:
         stats = tracker.current_stats()

@@ -83,12 +83,12 @@ def decode_points(blob):
     return json.loads(gzip.decompress(blob))
 
 
-def create_run(started_at, utc_offset_minutes, goal_distance_miles, test_mode, algorithm_version):
+def create_run(started_at, utc_offset_minutes, goal_distance_miles, target_pace_seconds, test_mode, algorithm_version):
     def work(cur):
         cur.execute(
             "INSERT INTO rst_runs (status, started_at, utc_offset_minutes, goal_distance_miles,"
-            " test_mode, algorithm_version) VALUES ('active', %s, %s, %s, %s, %s)",
-            (started_at, utc_offset_minutes, goal_distance_miles, int(test_mode), algorithm_version),
+            " target_pace_seconds, test_mode, algorithm_version) VALUES ('active', %s, %s, %s, %s, %s, %s)",
+            (started_at, utc_offset_minutes, goal_distance_miles, target_pace_seconds, int(test_mode), algorithm_version),
         )
         return cur.lastrowid
     return _transaction(work)
@@ -131,6 +131,32 @@ def finish_run(run_id, ended_at, summary, goal_reached):
                 " ON DUPLICATE KEY UPDATE pace_seconds = VALUES(pace_seconds),"
                 " distance_miles = VALUES(distance_miles)",
                 splits,
+            )
+    _transaction(work)
+
+
+CONDITION_COLUMNS = (
+    "temperature_f", "feels_like_f", "humidity_pct", "wind_mph", "wind_direction_deg",
+    "precipitation_in", "weather_code", "is_day",
+)
+
+
+def save_conditions(run_id, conditions):
+    values = [conditions.get(c) for c in CONDITION_COLUMNS]
+
+    def work(cur):
+        cur.execute(
+            f"INSERT INTO rst_run_conditions (run_id, {', '.join(CONDITION_COLUMNS)})"
+            f" VALUES (%s, {', '.join(['%s'] * len(CONDITION_COLUMNS))})"
+            " ON DUPLICATE KEY UPDATE run_id = run_id",
+            (run_id, *values),
+        )
+        # Overland timestamps are UTC, so the weather lookup is where the
+        # run's local time offset comes from.
+        if conditions.get("utc_offset_minutes") is not None:
+            cur.execute(
+                "UPDATE rst_runs SET utc_offset_minutes = %s WHERE id = %s AND utc_offset_minutes IS NULL",
+                (conditions["utc_offset_minutes"], run_id),
             )
     _transaction(work)
 

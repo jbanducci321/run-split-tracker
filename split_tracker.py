@@ -145,6 +145,7 @@ class RunTracker:
             "moving_display": format_duration(moving_seconds),
             "average_pace_seconds": round(average_pace_seconds, 1) if average_pace_seconds else None,
             "average_pace_display": format_pace(average_pace_seconds) if average_pace_seconds else None,
+            "current_pace_seconds": round(current_pace_seconds, 1) if current_pace_seconds else None,
             "current_pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "splits": [
                 {"mile": s["mile"], "pace_seconds": round(s["pace_seconds"], 1), "pace_display": s["pace_display"]}
@@ -166,6 +167,7 @@ class RunTracker:
         # Instantaneous pace of the last few steps (usually slowing to a stop)
         # is meaningless once the run is over.
         summary["current_pace_display"] = None
+        summary["current_pace_seconds"] = None
         self.reset()
         return summary
 
