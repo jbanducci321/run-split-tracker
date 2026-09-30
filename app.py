@@ -29,6 +29,14 @@ if PERSISTENCE_ENABLED:
 else:
     logger.warning("Run saving DISABLED - set %s to enable it", ", ".join(db.REQUIRED_ENV))
 
+# Restart recovery: resume a run in progress from its saved points after the
+# app restarts mid-run. Opt-in, and only meant for the deployed (Railway)
+# copy - a local copy shares the same database and must never take over a
+# live run.
+RECOVERY_ENABLED = PERSISTENCE_ENABLED and os.environ.get("RECOVER_ACTIVE_RUNS", "").lower() == "true"
+RECOVERY_WINDOW_SECONDS = 120  # run's first point vs. the Overland trip's start time
+logger.info("Restart recovery %s", "enabled" if RECOVERY_ENABLED else "disabled")
+
 app = Flask(__name__)
 
 OVERLAND_ACCESS_TOKEN = os.environ.get("OVERLAND_ACCESS_TOKEN", "")
@@ -133,6 +141,72 @@ def ensure_run_recorded():
         logger.exception("DB: couldn't create the run row - retrying in %ds", CHUNK_FLUSH_SECONDS)
         return
     logger.info("DB: run %s started", recording["run_id"])
+    flush_points(force=True)  # get the first points saved now, so there's something to recover from
+
+    if RECOVERY_ENABLED:
+        # This is a fresh trip, so any run still marked active is one that
+        # couldn't be resumed after a restart.
+        try:
+            stale = db.mark_other_active_runs_interrupted(recording["run_id"])
+            if stale:
+                logger.warning("DB: marked %d leftover active run(s) as interrupted", stale)
+        except Exception:
+            logger.exception("DB: couldn't mark leftover active runs as interrupted")
+
+
+def tracker_input(props, lat, lon):
+    """(lat, lon, timestamp, accuracy, speed) for RunTracker.process_point, or None if unusable."""
+    timestamp_raw = props.get("timestamp")
+    if not timestamp_raw or lat is None or lon is None:
+        return None
+    return lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy"), props.get("speed")
+
+
+def recover_run(trip):
+    """After a restart, resume the run for this same Overland trip from its saved points.
+
+    Any failure or mismatch falls back to starting fresh - exactly what
+    happens without recovery - so this can never leave things worse.
+    """
+    global trip_announced
+    trip_start_raw = (trip or {}).get("start")
+    if not RECOVERY_ENABLED or not trip_start_raw:
+        return
+    try:
+        found = db.find_recoverable_run(to_utc_naive(parse_timestamp(trip_start_raw)), RECOVERY_WINDOW_SECONDS)
+        if not found:
+            return
+        run_id, goal, target, test_mode = found
+        saved, next_chunk = db.load_points(run_id)
+        inputs = [tracker_input(p, p.get("lat"), p.get("lon")) for p in saved]
+        # Replay straight into the tracker, never through the DM code, so
+        # nothing already announced gets announced again.
+        for point in sorted((p for p in inputs if p), key=lambda p: p[2]):
+            tracker.process_point(*point)
+    except Exception:
+        logger.exception("Recovery: failed - starting this trip fresh")
+        tracker.reset()
+        return
+
+    recording.update(run_id=run_id, buffer=[], chunk_index=next_chunk, last_db_attempt=time.monotonic())
+    # Settings reset on restart; the run row remembers what this trip used.
+    admin_state["goal_distance_miles"] = float(goal) if goal is not None else None
+    admin_state["discord_test_mode"] = bool(test_mode)
+    if target is not None:
+        admin_state.update(target_pace_seconds=int(target), target_pace_enabled=True)
+    distance = tracker.cumulative_meters / MILE_METERS
+    goal = admin_state["goal_distance_miles"]
+    tracker.goal_half_notified = bool(goal) and distance >= goal / 2
+    tracker.goal_notified = bool(goal) and distance >= goal
+    trip_announced = True
+    try:
+        db.set_algorithm_version(run_id, ALGORITHM_VERSION)  # replay just recomputed it with this version
+    except Exception:
+        logger.exception("Recovery: couldn't update run %s algorithm_version", run_id)
+    logger.warning(
+        "Recovery: resumed run %s after a restart - replayed %d saved points (%.2f mi, %d splits)",
+        run_id, len(saved), distance, len(tracker.splits),
+    )
 
 
 def flush_points(force=False):
@@ -327,26 +401,28 @@ def receive_overland_batch():
                 finish_recording(last_summary, ended_at, goal_reached)
         return jsonify(result="ok")
 
+    if not tracker.active and recording["run_id"] is None:
+        recover_run(payload.get("trip"))  # no-op unless this trip was cut off by a restart
+
     if PERSISTENCE_ENABLED:
         recording["buffer"].extend(db.raw_point(feature) for feature in locations)
 
     points = []
     for feature in locations:
-        props = feature.get("properties", {})
-        timestamp_raw = props.get("timestamp")
-        if not timestamp_raw:
-            continue
-        lon, lat = feature.get("geometry", {}).get("coordinates", [None, None])
-        if lat is None or lon is None:
-            continue
-        points.append((
-            lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy"), props.get("speed"),
-        ))
+        lon, lat = (feature.get("geometry", {}).get("coordinates") or [None, None])[:2]
+        point = tracker_input(feature.get("properties", {}), lat, lon)
+        if point:
+            points.append(point)
 
     points.sort(key=lambda p: p[2])
 
+    # Save right away after any point that triggered a checkpoint DM, so a
+    # restart can't replay short of it and send that DM a second time.
+    dm_checkpoint_hit = False
+
     for lat, lon, timestamp, accuracy, speed in points:
         event = tracker.process_point(lat, lon, timestamp, accuracy, speed)
+        dm_checkpoint_hit = dm_checkpoint_hit or event is not None
 
         if admin_state["discord_test_mode"]:
             due = (
@@ -374,6 +450,7 @@ def receive_overland_batch():
         distance_miles = tracker.cumulative_meters / MILE_METERS
         if goal and not tracker.goal_half_notified and distance_miles >= goal / 2:
             tracker.goal_half_notified = True
+            dm_checkpoint_hit = True
             stats = tracker.current_stats()
             logger.info("GOAL HALFWAY: %.2f / %.2f mi", goal / 2, goal)
             send_dm(
@@ -382,12 +459,13 @@ def receive_overland_batch():
             )
         if goal and not tracker.goal_notified and distance_miles >= goal:
             tracker.goal_notified = True
+            dm_checkpoint_hit = True
             logger.info("GOAL REACHED: %.2f mi", goal)
             send_dm(f"Goal reached! {goal:.2f} mi")
 
     if PERSISTENCE_ENABLED and tracker.active:
         ensure_run_recorded()
-        flush_points()
+        flush_points(force=dm_checkpoint_hit)
 
     # First accepted point of a new trip: announce it (weather lookup runs in
     # the background so it can't slow down Overland's request).

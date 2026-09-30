@@ -163,3 +163,51 @@ def save_conditions(run_id, conditions):
 
 def set_run_status(run_id, status):
     _transaction(lambda cur: cur.execute("UPDATE rst_runs SET status = %s WHERE id = %s", (status, run_id)))
+
+
+def find_recoverable_run(trip_start, window_seconds):
+    """The still-'active' run that started within window_seconds of this Overland trip's start, if any.
+
+    A run's started_at is its first point's timestamp, which lands seconds
+    after the trip's own start - so a match means it's the same trip.
+    """
+    def work(cur):
+        cur.execute(
+            "SELECT id, goal_distance_miles, target_pace_seconds, test_mode FROM rst_runs"
+            " WHERE status = 'active' AND source = 'tracker'"
+            " AND started_at BETWEEN %s - INTERVAL %s SECOND AND %s + INTERVAL %s SECOND"
+            " ORDER BY started_at DESC LIMIT 1",
+            (trip_start, window_seconds, trip_start, window_seconds),
+        )
+        return cur.fetchone()
+    return _transaction(work)
+
+
+def load_points(run_id):
+    """Every saved raw point for a run, in chunk order, as dicts - plus the next free chunk index."""
+    def work(cur):
+        cur.execute(
+            "SELECT chunk_index, points_gz FROM rst_point_chunks WHERE run_id = %s ORDER BY chunk_index",
+            (run_id,),
+        )
+        return cur.fetchall()
+    rows = _transaction(work)
+    points = []
+    for _, blob in rows:
+        data = decode_points(blob)
+        points.extend(dict(zip(data["fields"], p)) for p in data["points"])
+    return points, (rows[-1][0] + 1 if rows else 0)
+
+
+def mark_other_active_runs_interrupted(keep_run_id):
+    """Only one trip can be in progress, so any other 'active' run is a dead one. Returns how many were marked."""
+    return _transaction(lambda cur: cur.execute(
+        "UPDATE rst_runs SET status = 'interrupted' WHERE status = 'active' AND source = 'tracker' AND id <> %s",
+        (keep_run_id,),
+    ))
+
+
+def set_algorithm_version(run_id, version):
+    _transaction(lambda cur: cur.execute(
+        "UPDATE rst_runs SET algorithm_version = %s WHERE id = %s", (version, run_id),
+    ))

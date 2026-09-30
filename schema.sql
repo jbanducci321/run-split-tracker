@@ -5,7 +5,9 @@
 CREATE TABLE rst_runs (
     id INT NOT NULL AUTO_INCREMENT,
     source VARCHAR(20) NOT NULL DEFAULT 'tracker',   -- 'tracker', or later 'strava_import' for backfilled runs
-    status VARCHAR(20) NOT NULL DEFAULT 'active',    -- 'active' until the trip ends, then 'completed'
+    status VARCHAR(20) NOT NULL DEFAULT 'active',    -- 'active' until the trip ends, then 'completed';
+                                                      -- 'reset' (admin reset mid-run) or 'interrupted'
+                                                      -- (app restarted and the trip couldn't be resumed)
     started_at DATETIME NOT NULL,                     -- UTC
     ended_at DATETIME NULL,                           -- UTC
     utc_offset_minutes SMALLINT NULL,
