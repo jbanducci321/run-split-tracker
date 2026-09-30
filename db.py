@@ -1,0 +1,139 @@
+import gzip
+import json
+import logging
+import os
+import threading
+
+import pymysql
+
+logger = logging.getLogger("run-split-tracker")
+
+REQUIRED_ENV = ("DB_HOST", "DB_NAME", "DB_USERNAME", "DB_PASSWORD")
+
+# Raw point fields saved in rst_point_chunks, in this order. The list is
+# stored inside every chunk too, so old chunks stay readable if fields are
+# added later.
+POINT_FIELDS = [
+    "timestamp", "lat", "lon", "horizontal_accuracy", "vertical_accuracy", "altitude",
+    "speed", "speed_accuracy", "course", "course_accuracy", "motion",
+]
+
+_lock = threading.Lock()
+_conn = None
+
+
+def is_configured():
+    return all(os.environ.get(key) for key in REQUIRED_ENV)
+
+
+def connect():
+    return pymysql.connect(
+        host=os.environ["DB_HOST"],
+        user=os.environ["DB_USERNAME"],
+        password=os.environ["DB_PASSWORD"],
+        database=os.environ["DB_NAME"],
+        charset="utf8mb4",
+        autocommit=False,
+        connect_timeout=10,
+        read_timeout=15,
+        write_timeout=15,
+    )
+
+
+def _transaction(work):
+    """Run work(cursor) as one transaction on the shared connection."""
+    global _conn
+    with _lock:
+        # RDS closes connections left idle past its wait_timeout, so check the
+        # connection is still alive (and reconnect if not) before every use.
+        if _conn is None:
+            _conn = connect()
+        else:
+            _conn.ping(reconnect=True)
+        try:
+            with _conn.cursor() as cur:
+                result = work(cur)
+            _conn.commit()
+            return result
+        except Exception:
+            try:
+                _conn.rollback()
+            except Exception:
+                _conn = None  # connection itself is broken; open a fresh one next time
+            raise
+
+
+def raw_point(feature):
+    """One Overland GeoJSON feature -> a row of POINT_FIELDS values, unfiltered."""
+    props = feature.get("properties") or {}
+    coords = (feature.get("geometry") or {}).get("coordinates") or []
+    location = {
+        "lon": coords[0] if len(coords) > 0 else None,
+        "lat": coords[1] if len(coords) > 1 else None,
+    }
+    return [location[f] if f in location else props.get(f) for f in POINT_FIELDS]
+
+
+def encode_points(points):
+    payload = {"fields": POINT_FIELDS, "points": points}
+    return gzip.compress(json.dumps(payload, separators=(",", ":")).encode())
+
+
+def decode_points(blob):
+    return json.loads(gzip.decompress(blob))
+
+
+def create_run(started_at, utc_offset_minutes, goal_distance_miles, test_mode, algorithm_version):
+    def work(cur):
+        cur.execute(
+            "INSERT INTO rst_runs (status, started_at, utc_offset_minutes, goal_distance_miles,"
+            " test_mode, algorithm_version) VALUES ('active', %s, %s, %s, %s, %s)",
+            (started_at, utc_offset_minutes, goal_distance_miles, int(test_mode), algorithm_version),
+        )
+        return cur.lastrowid
+    return _transaction(work)
+
+
+def save_point_chunk(run_id, chunk_index, points):
+    # ON DUPLICATE KEY makes a retry after an ambiguous failure harmless.
+    _transaction(lambda cur: cur.execute(
+        "INSERT INTO rst_point_chunks (run_id, chunk_index, point_count, points_gz)"
+        " VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE run_id = run_id",
+        (run_id, chunk_index, len(points), encode_points(points)),
+    ))
+
+
+def finish_run(run_id, ended_at, summary, goal_reached):
+    splits = [(run_id, s["mile"], 1.0, s["pace_seconds"], 0) for s in summary["splits"]]
+    partial = summary.get("partial_split")
+    if partial:
+        splits.append((run_id, len(summary["splits"]) + 1, partial["distance_miles"], partial["pace_seconds"], 1))
+
+    def work(cur):
+        cur.execute(
+            "UPDATE rst_runs SET status = 'completed', ended_at = %s, distance_miles = %s,"
+            " moving_seconds = %s, elapsed_seconds = %s, avg_pace_seconds = %s, goal_reached = %s"
+            " WHERE id = %s",
+            (
+                ended_at,
+                summary["distance_miles"],
+                round(summary["moving_seconds"]),
+                round(summary["elapsed_seconds"]),
+                summary["average_pace_seconds"],
+                int(goal_reached),
+                run_id,
+            ),
+        )
+        if splits:
+            cur.executemany(
+                "INSERT INTO rst_splits (run_id, mile_number, distance_miles, pace_seconds, is_partial)"
+                " VALUES (%s, %s, %s, %s, %s)"
+                " ON DUPLICATE KEY UPDATE pace_seconds = VALUES(pace_seconds),"
+                " distance_miles = VALUES(distance_miles)",
+                splits,
+            )
+    _transaction(work)
+
+
+def set_run_status(run_id, status):
+    _transaction(lambda cur: cur.execute("UPDATE rst_runs SET status = %s WHERE id = %s", (status, run_id)))

@@ -2,6 +2,11 @@ import math
 from collections import deque
 from datetime import datetime
 
+# Saved with every run. Bump it whenever a change would alter the numbers the
+# tracker produces from the same raw points, so stored runs can be told apart
+# (and reprocessed from their raw points) later.
+ALGORITHM_VERSION = "v4-autopause"
+
 MILE_METERS = 1609.344
 CHECKPOINT_METERS = MILE_METERS / 2  # report every half mile: halfway pace, then full-mile split
 
@@ -138,6 +143,7 @@ class RunTracker:
             "elapsed_display": format_duration(elapsed_seconds),
             "moving_seconds": moving_seconds,
             "moving_display": format_duration(moving_seconds),
+            "average_pace_seconds": round(average_pace_seconds, 1) if average_pace_seconds else None,
             "average_pace_display": format_pace(average_pace_seconds) if average_pace_seconds else None,
             "current_pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "splits": [
@@ -147,6 +153,7 @@ class RunTracker:
             "fastest_split": {"mile": fastest["mile"], "pace_display": fastest["pace_display"]} if fastest else None,
             "partial_split": {
                 "distance_miles": round(partial_distance_miles, 2),
+                "pace_seconds": round(partial_pace_seconds, 1),
                 "pace_display": format_pace(partial_pace_seconds),
             } if partial_pace_seconds else None,
             "path": [[lat, lon] for lat, lon in self.path],
