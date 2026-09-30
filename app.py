@@ -1,4 +1,5 @@
 import hmac
+import json
 import logging
 import os
 import threading
@@ -51,15 +52,22 @@ MAX_GOAL_MILES = 99.99
 MIN_TARGET_PACE_SECONDS = 60             # 1:00/mi - the admin dropdowns offer 1-10 minutes, 0-59 seconds
 MAX_TARGET_PACE_SECONDS = 10 * 60 + 59   # 10:59/mi
 
-# Live, password-changeable settings. DISCORD_TEST_MODE env var is just the
-# startup default; the admin panel can flip these without a restart. Any
-# restart/redeploy resets them back to whatever the env vars say.
+# Live, password-changeable settings, saved to rst_settings so they survive
+# restarts. These values (and the DISCORD_TEST_MODE env var) are only the
+# defaults until anything has been saved.
 admin_state = {
     "discord_test_mode": os.environ.get("DISCORD_TEST_MODE", "false").lower() == "true",
     "goal_distance_miles": None,
     "target_pace_enabled": False,
     "target_pace_seconds": None,  # kept while disabled, so toggling back on restores it
 }
+
+# The database is shared by the deployed app and any local copy, so each
+# saves its settings under its own scope - a goal set while testing locally
+# can't change the live settings. Railway names its environment
+# ("production"); anywhere else defaults to "local".
+SETTINGS_SCOPE = os.environ.get("SETTINGS_SCOPE") or os.environ.get("RAILWAY_ENVIRONMENT_NAME") or "local"
+settings_state = {"loaded": False, "changed": False, "last_attempt": float("-inf")}
 
 tracker = RunTracker()
 last_summary = None  # most recently finished trip, kept until a new one starts
@@ -70,6 +78,66 @@ announce_thread = None
 
 def effective_target_pace():
     return admin_state["target_pace_seconds"] if admin_state["target_pace_enabled"] else None
+
+
+def setting_key(name):
+    return f"{SETTINGS_SCOPE}:{name}"
+
+
+def clean_setting(name, value):
+    """Re-validate a saved setting (it may have been edited by hand in the database)."""
+    if name in ("discord_test_mode", "target_pace_enabled"):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be true or false")
+        return value
+    if name == "goal_distance_miles":
+        return validate_goal_distance(value)
+    return None if value is None else validate_target_pace(value)
+
+
+def load_settings():
+    """Restore saved admin settings. Retries (at most once a minute) if the
+    database was unreachable, but only until something is changed in the
+    admin panel - after that, the in-memory values are the newest ones."""
+    if not PERSISTENCE_ENABLED or settings_state["loaded"] or settings_state["changed"]:
+        return
+    if time.monotonic() - settings_state["last_attempt"] < CHUNK_FLUSH_SECONDS:
+        return
+    settings_state["last_attempt"] = time.monotonic()
+    try:
+        stored = db.load_settings([setting_key(name) for name in admin_state])
+    except Exception:
+        logger.exception("Settings: couldn't load saved settings - using defaults, will retry")
+        return
+
+    restored = {}
+    for name in admin_state:
+        raw = stored.get(setting_key(name))
+        if raw is None:
+            continue
+        try:
+            restored[name] = clean_setting(name, json.loads(raw))
+        except (ValueError, TypeError):
+            logger.warning("Settings: ignoring invalid saved %s = %r", name, raw)
+    admin_state.update(restored)
+    if admin_state["target_pace_enabled"] and admin_state["target_pace_seconds"] is None:
+        admin_state["target_pace_enabled"] = False
+    settings_state["loaded"] = True
+    logger.info("Settings: loaded %s (scope %r)", restored or "nothing saved yet", SETTINGS_SCOPE)
+
+
+def persist_settings(updates):
+    """Save changed settings. Returns True/False, or None when saving is off."""
+    if not PERSISTENCE_ENABLED or not updates:
+        return None
+    settings_state["changed"] = True
+    try:
+        db.save_settings({setting_key(name): json.dumps(value) for name, value in updates.items()})
+    except Exception:
+        logger.exception("Settings: couldn't save %s - applied until the next restart only", sorted(updates))
+        return False
+    logger.info("Settings: saved %s", updates)
+    return True
 
 
 def target_note(pace_seconds):
@@ -189,11 +257,14 @@ def recover_run(trip):
         return
 
     recording.update(run_id=run_id, buffer=[], chunk_index=next_chunk, last_db_attempt=time.monotonic())
-    # Settings reset on restart; the run row remembers what this trip used.
-    admin_state["goal_distance_miles"] = float(goal) if goal is not None else None
-    admin_state["discord_test_mode"] = bool(test_mode)
-    if target is not None:
-        admin_state.update(target_pace_seconds=int(target), target_pace_enabled=True)
+    # Saved settings are the newest (they include any mid-run changes). Only
+    # if they couldn't be loaded, fall back to what the run row recorded at
+    # the start of this trip.
+    if not settings_state["loaded"]:
+        admin_state["goal_distance_miles"] = float(goal) if goal is not None else None
+        admin_state["discord_test_mode"] = bool(test_mode)
+        if target is not None:
+            admin_state.update(target_pace_seconds=int(target), target_pace_enabled=True)
     distance = tracker.cumulative_meters / MILE_METERS
     goal = admin_state["goal_distance_miles"]
     tracker.goal_half_notified = bool(goal) and distance >= goal / 2
@@ -349,6 +420,8 @@ def admin_settings():
     if not is_admin_password_correct(data.get("password", "")):
         return jsonify(error="unauthorized"), 401
 
+    load_settings()  # no-op once loaded; retries if the database was down at startup
+
     # Validate everything first so a bad value can't leave settings half-applied.
     updates = {}
     try:
@@ -367,12 +440,14 @@ def admin_settings():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     admin_state.update(updates)
+    saved = persist_settings(updates)
 
     return jsonify(
         discord_test_mode=admin_state["discord_test_mode"],
         goal_distance_miles=admin_state["goal_distance_miles"],
         target_pace_enabled=admin_state["target_pace_enabled"],
         target_pace_seconds=admin_state["target_pace_seconds"],
+        saved=saved,  # False = applied, but couldn't be stored (resets on restart)
     )
 
 
@@ -402,6 +477,7 @@ def receive_overland_batch():
         return jsonify(result="ok")
 
     if not tracker.active and recording["run_id"] is None:
+        load_settings()  # a trip is starting - make sure its goal/target are the saved ones
         recover_run(payload.get("trip"))  # no-op unless this trip was cut off by a restart
 
     if PERSISTENCE_ENABLED:
@@ -489,6 +565,8 @@ def receive_overland_batch():
 
     return jsonify(result="ok")
 
+
+load_settings()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

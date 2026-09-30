@@ -161,6 +161,29 @@ def save_conditions(run_id, conditions):
     _transaction(work)
 
 
+def load_settings(keys):
+    """{setting_key: setting_value} for whichever of these keys are saved."""
+    if not keys:
+        return {}
+
+    def work(cur):
+        cur.execute(
+            f"SELECT setting_key, setting_value FROM rst_settings WHERE setting_key IN ({', '.join(['%s'] * len(keys))})",
+            tuple(keys),
+        )
+        return dict(cur.fetchall())
+    return _transaction(work)
+
+
+def save_settings(values):
+    """Upsert {setting_key: setting_value} pairs."""
+    _transaction(lambda cur: cur.executemany(
+        "INSERT INTO rst_settings (setting_key, setting_value) VALUES (%s, %s)"
+        " ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+        list(values.items()),
+    ))
+
+
 def set_run_status(run_id, status):
     _transaction(lambda cur: cur.execute("UPDATE rst_runs SET status = %s WHERE id = %s", (status, run_id)))
 

@@ -504,6 +504,16 @@
 
     document.getElementById('admin-lock-btn').addEventListener('click', showLoggedOut);
 
+    function showSaved(statusEl, message, okClass, data) {
+      if (data.saved === false) {
+        statusEl.textContent = `${message} Couldn't save it to the database, so it resets on restart.`;
+        statusEl.className = 'small mt-3 text-warning-emphasis';
+      } else {
+        statusEl.textContent = message;
+        statusEl.className = `small mt-3 ${okClass}`;
+      }
+    }
+
     async function setTestMode(enabled) {
       const statusEl = document.getElementById('admin-status');
       try {
@@ -514,8 +524,8 @@
           statusEl.className = 'small text-danger mt-3';
           return;
         }
-        statusEl.textContent = 'Test mode is now ' + (data.discord_test_mode ? 'ON' : 'OFF') + '.';
-        statusEl.className = 'small mt-3 ' + (data.discord_test_mode ? 'text-warning' : 'text-success');
+        showSaved(statusEl, 'Test mode is now ' + (data.discord_test_mode ? 'ON' : 'OFF') + '.',
+                  data.discord_test_mode ? 'text-warning-emphasis' : 'text-success', data);
       } catch (err) {
         statusEl.textContent = 'Request failed - check the console.';
         statusEl.className = 'small text-danger mt-3';
@@ -533,10 +543,9 @@
           statusEl.className = 'small text-danger mt-3';
           return;
         }
-        statusEl.textContent = data.goal_distance_miles
+        showSaved(statusEl, data.goal_distance_miles
           ? `Goal set to ${data.goal_distance_miles.toFixed(2)} mi.`
-          : 'Goal cleared.';
-        statusEl.className = 'small mt-3 text-success';
+          : 'Goal cleared.', 'text-success', data);
         document.getElementById('admin-goal-input').value = data.goal_distance_miles ?? '';
       } catch (err) {
         statusEl.textContent = 'Request failed - check the console.';
@@ -561,8 +570,7 @@
         }
         fillAdminControls(data);
         const pace = `${Math.floor(data.target_pace_seconds / 60)}:${String(data.target_pace_seconds % 60).padStart(2, '0')}/mi`;
-        statusEl.textContent = data.target_pace_enabled ? `Target pace on: ${pace}.` : 'Target pace off.';
-        statusEl.className = 'small mt-3 text-success';
+        showSaved(statusEl, data.target_pace_enabled ? `Target pace on: ${pace}.` : 'Target pace off.', 'text-success', data);
         refresh();
       } catch (err) {
         statusEl.textContent = 'Request failed - check the console.';
