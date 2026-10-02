@@ -657,9 +657,14 @@
           statusEl.className = 'small text-danger mt-3';
           return;
         }
+        const mapFrom = {
+          'current run': 'your current run',
+          'location (no trip active)': 'your location from outside a trip',
+          'last run': 'your last run',
+        }[data.map_source];
         statusEl.textContent = data.with_map
-          ? 'Test 6.7 DM sent to you, with the route map.'
-          : `Test 6.7 DM sent to you, without a map (${data.had_route ? "the map couldn't be drawn" : 'no route yet'}).`;
+          ? `Test 6.7 DM sent to you, with a map of ${mapFrom}.`
+          : `Test 6.7 DM sent to you, without a map (${data.map_source ? "the map couldn't be drawn" : 'no location or run yet - turn on always-on tracking in Overland, or start a trip'}).`;
         statusEl.className = 'small mt-3 ' + (data.with_map ? 'text-success' : 'text-warning-emphasis');
       } catch (err) {
         statusEl.textContent = 'Request failed - check the console.';

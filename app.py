@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import timezone
 
 from dotenv import load_dotenv
@@ -196,6 +196,13 @@ def announce_trip_start(run_id, lat, lon, goal, target):
         logger.info("DB: run %s start conditions saved", run_id)
     except Exception:
         logger.exception("DB: run %s start conditions couldn't be saved", run_id)
+
+# Locations Overland sends while no trip is active (only happens with its
+# always-on tracking turned on). Memory only, never saved, never part of a
+# run - used solely by the 6.7 test button, so the map can be checked
+# without starting a trip.
+RECENT_LOCATION_MAX_AGE_SECONDS = 10 * 60
+recent_locations = deque(maxlen=60)  # (lat, lon, monotonic time received)
 
 # Database state for the trip in progress.
 recording = {"run_id": None, "buffer": [], "chunk_index": 0, "last_db_attempt": float("-inf")}
@@ -504,18 +511,32 @@ def admin_settings():
 
 @app.post("/admin/six-seven-test")
 def admin_six_seven_test():
-    """Send the 6.7 DM to you right now (never to the friend), using the
-    current or last run's route and pace, so it can be checked without a run."""
+    """Send the 6.7 DM to you right now (never to the friend), so it can be
+    checked without a run. The text uses the current or last run's pace; the
+    map uses, in order: the trip in progress, your location from outside a
+    trip (Overland's always-on tracking, last 10 min), or the last run."""
     data = request.get_json(silent=True) or {}
     if not is_admin_password_correct(data.get("password", "")):
         return jsonify(error="unauthorized"), 401
 
     stats = tracker.current_stats() if tracker.active else (last_summary or tracker.current_stats())
-    path = [tuple(p) for p in stats["path"]]
-    sent, with_map = send_six_seven(six_seven_message(stats["average_pace_display"]), path, None, "you (test button)")
+    cutoff = time.monotonic() - RECENT_LOCATION_MAX_AGE_SECONDS
+    recent = [(lat, lon) for lat, lon, received in recent_locations if received >= cutoff]
+    if tracker.active:
+        path, map_source = [tuple(p) for p in stats["path"]], "current run"
+    elif recent:
+        path, map_source = recent, "location (no trip active)"
+    else:
+        path, map_source = [tuple(p) for p in stats["path"]], "last run"
+    if not path:
+        map_source = None
+
+    sent, with_map = send_six_seven(
+        six_seven_message(stats["average_pace_display"]), path, None, f"you (test button, map: {map_source or 'none'})",
+    )
     if not sent:
         return jsonify(error="the DM couldn't be sent - check the logs"), 502
-    return jsonify(sent=True, with_map=with_map, had_route=bool(path))
+    return jsonify(sent=True, with_map=with_map, map_source=map_source)
 
 
 @app.post("/overland")
@@ -530,6 +551,10 @@ def receive_overland_batch():
     trip_active = bool(payload.get("trip"))
 
     if not trip_active:
+        for feature in locations:  # kept only for the 6.7 test button's map
+            lon, lat = (feature.get("geometry", {}).get("coordinates") or [None, None])[:2]
+            if lat is not None and lon is not None:
+                recent_locations.append((lat, lon, time.monotonic()))
         if tracker.active:
             log_ping_summary(force=True)  # the trip's last partial minute
             trip_announced = False
