@@ -85,6 +85,7 @@ class RunTracker:
 
     def reset(self):
         self.active = False
+        self.last_outcome = None
         self.start_time = None
         self.last_seen_time = None
 
@@ -172,12 +173,16 @@ class RunTracker:
         return summary
 
     def process_point(self, lat, lon, timestamp, accuracy, speed=None):
+        """Feed one GPS point in. Returns a checkpoint event or None, and sets
+        last_outcome to what happened to the point (for the ping summary log)."""
         if not self.active:
             self.reset()
             self.active = True
             self.start_time = timestamp
+        self.last_outcome = "counted"
 
         if accuracy is not None and accuracy > MAX_ACCURACY_METERS:
+            self.last_outcome = "poor accuracy"
             return None
 
         self.last_seen_time = timestamp
@@ -188,10 +193,12 @@ class RunTracker:
             prev_lat, prev_lon, prev_time = self.last_raw_point
             elapsed = (timestamp - prev_time).total_seconds()
             if elapsed <= 0:
-                return None  # out-of-order or duplicate point
+                self.last_outcome = "duplicate/out of order"
+                return None
             raw_distance = haversine_meters(prev_lat, prev_lon, lat, lon)
             if raw_distance / elapsed > MAX_PLAUSIBLE_SPEED_MPS:
-                return None  # GPS jump - keep it out of the smoothing buffer entirely
+                self.last_outcome = "GPS jump"
+                return None  # keep it out of the smoothing buffer entirely
 
         self.last_raw_point = (lat, lon, timestamp)
 
@@ -208,11 +215,13 @@ class RunTracker:
 
         # iOS reports -1 when speed is unknown, so only trust non-negative values.
         if speed is not None and 0 <= speed < STATIONARY_SPEED_MPS:
+            self.last_outcome = "standing still"
             return None  # phone says you're standing still - GPS wobble isn't distance
 
         anchor_lat, anchor_lon, anchor_time = self.distance_anchor
         distance = haversine_meters(anchor_lat, anchor_lon, lat, lon)
         if distance < MIN_MOVEMENT_METERS:
+            self.last_outcome = "jitter (<5m moved)"
             return None  # not enough movement yet to be confident this is real, not jitter
 
         anchor_elapsed = (timestamp - anchor_time).total_seconds()

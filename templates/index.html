@@ -108,13 +108,13 @@
       <button id="admin-login-btn" class="btn btn-sm btn-outline-secondary">Admin Login</button>
 
       <div id="admin-login-box" class="card bg-secondary-subtle text-dark mt-2" style="max-width: 360px;" hidden>
-        <div class="card-body">
+        <form id="admin-login-form" class="card-body">
           <div class="input-group">
-            <input type="password" id="admin-password" class="form-control" placeholder="Admin password">
-            <button id="admin-login-submit" class="btn btn-primary">Unlock</button>
+            <input type="password" id="admin-password" class="form-control" placeholder="Admin password" autocomplete="current-password">
+            <button type="submit" id="admin-login-submit" class="btn btn-primary">Unlock</button>
           </div>
           <div id="admin-login-error" class="small text-danger mt-2"></div>
-        </div>
+        </form>
       </div>
 
       <div id="admin-panel" class="card bg-secondary-subtle text-dark mt-2" hidden>
@@ -153,6 +153,25 @@
               <span>:</span>
               <select id="admin-target-sec" class="form-select form-select-sm w-auto" aria-label="Target pace seconds"></select>
               <span class="small text-muted">/mi</span>
+            </div>
+          </div>
+          <div class="mt-3">
+            <label class="form-label small text-muted" for="admin-67-enabled">
+              6.7 mile DM (once per run: a message and route map to your friend)
+            </label>
+            <div class="d-flex flex-wrap align-items-center gap-3">
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" role="switch" id="admin-67-enabled">
+                <label class="form-check-label small" for="admin-67-enabled">On</label>
+              </div>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" role="switch" id="admin-67-test">
+                <label class="form-check-label small" for="admin-67-test">Test mode (send to me instead)</label>
+              </div>
+              <button id="admin-67-send-test" class="btn btn-outline-primary btn-sm">Send test DM to me now</button>
+            </div>
+            <div id="admin-67-note" class="small text-warning-emphasis mt-1" hidden>
+              SIX_SEVEN_DISCORD_ID isn't set, so this DM can only go to you (test mode or the test button).
             </div>
           </div>
           <hr>
@@ -448,6 +467,7 @@
     function showLoggedOut() {
       adminPassword = '';
       sessionStorage.removeItem('adminPassword');
+      document.getElementById('admin-password').value = '';
       document.getElementById('admin-login-btn').hidden = false;
       document.getElementById('admin-login-box').hidden = true;
       document.getElementById('admin-panel').hidden = true;
@@ -475,14 +495,21 @@
       targetMin.value = String(Math.floor(target / 60));
       targetSec.value = String(target % 60);
       targetEnabled.checked = !!data.target_pace_enabled;
+      document.getElementById('admin-67-enabled').checked = !!data.six_seven_enabled;
+      document.getElementById('admin-67-test').checked = !!data.six_seven_test_mode;
+      document.getElementById('admin-67-note').hidden = !!data.six_seven_configured;
     }
 
     document.getElementById('admin-login-btn').addEventListener('click', () => {
       document.getElementById('admin-login-box').hidden = false;
+      document.getElementById('admin-password').focus();
     });
 
-    document.getElementById('admin-login-submit').addEventListener('click', async () => {
-      const entered = document.getElementById('admin-password').value;
+    // A real <form>, so Enter in the password box submits it.
+    document.getElementById('admin-login-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const passwordInput = document.getElementById('admin-password');
+      const entered = passwordInput.value;
       const errEl = document.getElementById('admin-login-error');
       adminPassword = entered;
       try {
@@ -493,6 +520,7 @@
           return;
         }
         sessionStorage.setItem('adminPassword', entered);
+        passwordInput.value = '';  // don't leave the correct password sitting in the box
         errEl.textContent = '';
         fillAdminControls(data);
         showLoggedIn();
@@ -580,6 +608,67 @@
     }
 
     [targetMin, targetSec, targetEnabled].forEach(el => el.addEventListener('change', saveTargetPace));
+
+    async function saveSixSeven() {
+      const statusEl = document.getElementById('admin-status');
+      try {
+        const { ok, status, data } = await callAdminSettings({
+          six_seven_enabled: document.getElementById('admin-67-enabled').checked,
+          six_seven_test_mode: document.getElementById('admin-67-test').checked,
+        });
+        if (!ok) {
+          if (status === 401) showLoggedOut();
+          statusEl.textContent = data.error || 'Request failed.';
+          statusEl.className = 'small text-danger mt-3';
+          return;
+        }
+        fillAdminControls(data);
+        const where = data.six_seven_test_mode ? 'to you (test mode)' : 'to your friend';
+        const message = data.six_seven_enabled
+          ? `6.7 DM on, sending ${where}.`
+          : `6.7 DM off${data.six_seven_test_mode ? ' (test mode is on, for when you turn it on)' : ''}.`;
+        showSaved(statusEl, message, 'text-success', data);
+      } catch (err) {
+        statusEl.textContent = 'Request failed - check the console.';
+        statusEl.className = 'small text-danger mt-3';
+        console.error('admin 6.7 request failed', err);
+      }
+    }
+
+    ['admin-67-enabled', 'admin-67-test'].forEach(id =>
+      document.getElementById(id).addEventListener('change', saveSixSeven));
+
+    document.getElementById('admin-67-send-test').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const statusEl = document.getElementById('admin-status');
+      button.disabled = true;
+      statusEl.textContent = 'Drawing the map and sending...';
+      statusEl.className = 'small text-muted mt-3';
+      try {
+        const res = await fetch('/admin/six-seven-test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: adminPassword }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (res.status === 401) showLoggedOut();
+          statusEl.textContent = data.error || 'Request failed.';
+          statusEl.className = 'small text-danger mt-3';
+          return;
+        }
+        statusEl.textContent = data.with_map
+          ? 'Test 6.7 DM sent to you, with the route map.'
+          : `Test 6.7 DM sent to you, without a map (${data.had_route ? "the map couldn't be drawn" : 'no route yet'}).`;
+        statusEl.className = 'small mt-3 ' + (data.with_map ? 'text-success' : 'text-warning-emphasis');
+      } catch (err) {
+        statusEl.textContent = 'Request failed - check the console.';
+        statusEl.className = 'small text-danger mt-3';
+        console.error('6.7 test DM failed', err);
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     async function resetRunData() {
       const statusEl = document.getElementById('admin-status');

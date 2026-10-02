@@ -4,12 +4,14 @@ import logging
 import os
 import threading
 import time
+from collections import Counter
 from datetime import timezone
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 
 import db
+import map_image
 import weather
 from discord_notifier import send_dm
 from split_tracker import (
@@ -60,7 +62,14 @@ admin_state = {
     "goal_distance_miles": None,
     "target_pace_enabled": False,
     "target_pace_seconds": None,  # kept while disabled, so toggling back on restores it
+    "six_seven_enabled": False,
+    "six_seven_test_mode": False,  # sends the 6.7 DM to you instead of SIX_SEVEN_DISCORD_ID
 }
+
+# Once per trip, the first time it passes 6.7 miles, DM SIX_SEVEN_DISCORD_ID
+# (a friend) a message plus a picture of the route so far.
+SIX_SEVEN_MILES = 6.7
+RUNNER_NAME = "Jacob"
 
 # The database is shared by the deployed app and any local copy, so each
 # saves its settings under its own scope - a goal set while testing locally
@@ -80,13 +89,26 @@ def effective_target_pace():
     return admin_state["target_pace_seconds"] if admin_state["target_pace_enabled"] else None
 
 
+def six_seven_message(average_pace_display):
+    goal = admin_state["goal_distance_miles"]
+    goal_part = f" out of {goal:g} miles" if goal else ""
+    return f"{RUNNER_NAME} has run {SIX_SEVEN_MILES:g} miles{goal_part} in {average_pace_display or 'an unknown pace'}"
+
+
+def send_six_seven(message, path, recipient_id, who):
+    """Render the route map and send the 6.7 DM. Slow (map tiles), so callers usually run it in a thread."""
+    image = map_image.render_route_png(path)  # logs its own failure; the DM still goes out without it
+    sent = send_dm(message, user_id=recipient_id, image_png=image, label=f"{who} [6.7 DM]")
+    return sent, image is not None
+
+
 def setting_key(name):
     return f"{SETTINGS_SCOPE}:{name}"
 
 
 def clean_setting(name, value):
     """Re-validate a saved setting (it may have been edited by hand in the database)."""
-    if name in ("discord_test_mode", "target_pace_enabled"):
+    if name in ("discord_test_mode", "target_pace_enabled", "six_seven_enabled", "six_seven_test_mode"):
         if not isinstance(value, bool):
             raise ValueError(f"{name} must be true or false")
         return value
@@ -163,7 +185,6 @@ def announce_trip_start(run_id, lat, lon, goal, target):
     if target:
         message += f". Target pace: {format_pace(target)}"
     send_dm(message)
-    logger.info("Sent: %s", message)
 
     if not (PERSISTENCE_ENABLED and conditions):
         return
@@ -178,6 +199,30 @@ def announce_trip_start(run_id, lat, lon, goal, target):
 
 # Database state for the trip in progress.
 recording = {"run_id": None, "buffer": [], "chunk_index": 0, "last_db_attempt": float("-inf")}
+
+# Overland sends a point every few seconds; instead of a log line per update,
+# tally them and log one summary about once a minute.
+PING_SUMMARY_SECONDS = 60
+ping_window = {"started": time.monotonic(), "updates": 0, "points": 0, "outcomes": Counter()}
+
+
+def log_ping_summary(force=False):
+    """One log line per ~minute: updates and points received, what happened to
+    each point (counted, or why it was skipped), and progress so far."""
+    elapsed = time.monotonic() - ping_window["started"]
+    if ping_window["updates"] == 0 or (elapsed < PING_SUMMARY_SECONDS and not force):
+        return
+    outcomes = ", ".join(f"{n} {name}" for name, n in ping_window["outcomes"].most_common()) or "none usable"
+    progress = ""
+    if tracker.active:
+        stats = tracker.current_stats()
+        pace = "PAUSED" if stats["paused"] else f"pace {stats['current_pace_display'] or '-'}"
+        progress = f" | {stats['distance_miles']:.2f} mi, moving {stats['moving_display']}, {pace}"
+    logger.info(
+        "Pings (last %ds): %d updates, %d points - %s%s",
+        round(elapsed), ping_window["updates"], ping_window["points"], outcomes, progress,
+    )
+    ping_window.update(started=time.monotonic(), updates=0, points=0, outcomes=Counter())
 
 
 def to_utc_naive(ts):
@@ -437,6 +482,9 @@ def admin_settings():
                 "target_pace_seconds", admin_state["target_pace_seconds"]
             ) is None:
                 raise ValueError("pick a target pace before enabling it")
+        for name in ("six_seven_enabled", "six_seven_test_mode"):
+            if name in data:
+                updates[name] = bool(data[name])
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     admin_state.update(updates)
@@ -447,8 +495,27 @@ def admin_settings():
         goal_distance_miles=admin_state["goal_distance_miles"],
         target_pace_enabled=admin_state["target_pace_enabled"],
         target_pace_seconds=admin_state["target_pace_seconds"],
+        six_seven_enabled=admin_state["six_seven_enabled"],
+        six_seven_test_mode=admin_state["six_seven_test_mode"],
+        six_seven_configured=bool(os.environ.get("SIX_SEVEN_DISCORD_ID")),
         saved=saved,  # False = applied, but couldn't be stored (resets on restart)
     )
+
+
+@app.post("/admin/six-seven-test")
+def admin_six_seven_test():
+    """Send the 6.7 DM to you right now (never to the friend), using the
+    current or last run's route and pace, so it can be checked without a run."""
+    data = request.get_json(silent=True) or {}
+    if not is_admin_password_correct(data.get("password", "")):
+        return jsonify(error="unauthorized"), 401
+
+    stats = tracker.current_stats() if tracker.active else (last_summary or tracker.current_stats())
+    path = [tuple(p) for p in stats["path"]]
+    sent, with_map = send_six_seven(six_seven_message(stats["average_pace_display"]), path, None, "you (test button)")
+    if not sent:
+        return jsonify(error="the DM couldn't be sent - check the logs"), 502
+    return jsonify(sent=True, with_map=with_map, had_route=bool(path))
 
 
 @app.post("/overland")
@@ -464,6 +531,7 @@ def receive_overland_batch():
 
     if not trip_active:
         if tracker.active:
+            log_ping_summary(force=True)  # the trip's last partial minute
             trip_announced = False
             ended_at, goal_reached = tracker.last_seen_time, tracker.goal_notified
             last_summary = tracker.end()
@@ -489,6 +557,12 @@ def receive_overland_batch():
         point = tracker_input(feature.get("properties", {}), lat, lon)
         if point:
             points.append(point)
+        else:
+            ping_window["outcomes"]["missing time/location"] += 1
+    if ping_window["updates"] == 0:
+        ping_window["started"] = time.monotonic()  # window starts at its first update, not at idle time
+    ping_window["updates"] += 1
+    ping_window["points"] += len(locations)
 
     points.sort(key=lambda p: p[2])
 
@@ -497,8 +571,29 @@ def receive_overland_batch():
     dm_checkpoint_hit = False
 
     for lat, lon, timestamp, accuracy, speed in points:
+        meters_before = tracker.cumulative_meters if tracker.active else 0.0
         event = tracker.process_point(lat, lon, timestamp, accuracy, speed)
+        ping_window["outcomes"][tracker.last_outcome] += 1
         dm_checkpoint_hit = dm_checkpoint_hit or event is not None
+
+        # 6.7 DM: fires on the crossing itself, so it happens once per trip
+        # (distance only grows) and switching it on after 6.7 doesn't fire it.
+        six_seven_meters = SIX_SEVEN_MILES * MILE_METERS
+        if admin_state["six_seven_enabled"] and meters_before < six_seven_meters <= tracker.cumulative_meters:
+            dm_checkpoint_hit = True
+            friend_id = os.environ.get("SIX_SEVEN_DISCORD_ID")
+            if admin_state["six_seven_test_mode"]:
+                recipient, who = None, "you (6.7 test mode)"
+            elif friend_id:
+                recipient, who = friend_id, "SIX_SEVEN_DISCORD_ID"
+            else:
+                recipient = who = None
+                logger.warning("6.7 DM skipped - SIX_SEVEN_DISCORD_ID isn't set (turn on 6.7 test mode to send it to yourself)")
+            if who:
+                message = six_seven_message(tracker.current_stats()["average_pace_display"])
+                threading.Thread(
+                    target=send_six_seven, args=(message, list(tracker.path), recipient, who), daemon=True,
+                ).start()
 
         if admin_state["discord_test_mode"]:
             due = (
@@ -555,14 +650,7 @@ def receive_overland_batch():
         )
         announce_thread.start()
 
-    if points and tracker.last_speed_mps is not None:
-        stats = tracker.current_stats()
-        logger.info(
-            "progress: %.2fmi total, moving %s, current pace %s",
-            stats["distance_miles"], stats["moving_display"],
-            "PAUSED" if stats["paused"] else stats["current_pace_display"],
-        )
-
+    log_ping_summary()
     return jsonify(result="ok")
 
 
