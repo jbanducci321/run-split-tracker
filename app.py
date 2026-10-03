@@ -71,6 +71,16 @@ admin_state = {
 SIX_SEVEN_MILES = 6.7
 RUNNER_NAME = "Jacob"
 
+
+def public_site_url():
+    """The dashboard's public address: PUBLIC_SITE_URL if set (e.g. a custom
+    domain), else the domain Railway sets automatically. None when running locally."""
+    url = os.environ.get("PUBLIC_SITE_URL")
+    if url:
+        return url.rstrip("/")
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    return f"https://{domain}" if domain else None
+
 # The database is shared by the deployed app and any local copy, so each
 # saves its settings under its own scope - a goal set while testing locally
 # can't change the live settings. Railway names its environment
@@ -92,7 +102,13 @@ def effective_target_pace():
 def six_seven_message(average_pace_display):
     goal = admin_state["goal_distance_miles"]
     goal_part = f" out of {goal:g} miles" if goal else ""
-    return f"{RUNNER_NAME} has run {SIX_SEVEN_MILES:g} miles{goal_part} in {average_pace_display or 'an unknown pace'}"
+    message = f"{RUNNER_NAME} has run {SIX_SEVEN_MILES:g} miles{goal_part} in {average_pace_display or 'an unknown pace'}"
+    site = public_site_url()
+    if site:
+        # Angle brackets keep the link clickable but stop Discord adding a
+        # preview card next to the route image.
+        message += f"\n\nYou can see the current progress here: <{site}>"
+    return message
 
 
 def send_six_seven(message, path, recipient_id, who):
