@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from collections import Counter, deque
-from datetime import timezone
+from datetime import timedelta, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
@@ -298,6 +298,68 @@ def tracker_input(props, lat, lon):
     return lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy"), props.get("speed")
 
 
+def replay_points(run_tracker, saved):
+    """Feed a run's saved raw points through a tracker - straight in, never
+    through the DM code, so nothing already announced gets announced again."""
+    inputs = [tracker_input(p, p.get("lat"), p.get("lon")) for p in saved]
+    for point in sorted((p for p in inputs if p), key=lambda p: p[2]):
+        run_tracker.process_point(*point)
+
+
+def restore_last_run():
+    """At startup, put the most recent finished run back on the dashboard -
+    otherwise every deploy/restart would blank it until the next run ends.
+    Rebuilt from its saved raw points, so it's identical to what was shown."""
+    global last_summary
+    try:
+        found = db.find_latest_completed_run()
+        if not found:
+            return
+        run_id, test_mode = found
+        saved, _ = db.load_points(run_id)
+        rebuilt = RunTracker()
+        replay_points(rebuilt, saved)
+        summary = rebuilt.end()
+    except Exception:
+        logger.exception("Startup: couldn't restore the last run to the dashboard")
+        return
+    summary.update(run_id=run_id, test_mode_used=bool(test_mode))
+    # A trip that started (or ended) while this was loading is newer - keep it.
+    if last_summary is None and not tracker.active:
+        last_summary = summary
+        logger.info("Startup: showing last run %s on the dashboard (%.2f mi)", run_id, summary["distance_miles"])
+
+
+# Fastest full mile ever, from real runs only (see db.load_best_mile). Read
+# from the database at startup and after each run - never per page refresh.
+MIN_RECORD_PACE_SECONDS = 4 * 60  # a "mile" faster than 4:00 is bad data, not a record
+best_mile = {"record": None, "loaded": False, "last_attempt": float("-inf")}
+
+
+def refresh_best_mile():
+    best_mile["last_attempt"] = time.monotonic()
+    try:
+        best_mile["record"] = db.load_best_mile(MIN_RECORD_PACE_SECONDS)
+    except Exception:
+        logger.exception("Records: couldn't load the fastest mile ever - will retry")
+        return
+    best_mile["loaded"] = True
+    record = best_mile["record"]
+    logger.info(
+        "Records: fastest mile ever %s",
+        f"{format_pace(record['pace_seconds'])} (run {record['run_id']}, mile {record['mile']})" if record else "- none yet",
+    )
+
+
+def run_in_background(target):
+    threading.Thread(target=target, daemon=True).start()
+
+
+def startup_from_database():
+    restore_last_run()
+    refresh_best_mile()
+
+
 def recover_run(trip):
     """After a restart, resume the run for this same Overland trip from its saved points.
 
@@ -314,11 +376,7 @@ def recover_run(trip):
             return
         run_id, goal, target, test_mode = found
         saved, next_chunk = db.load_points(run_id)
-        inputs = [tracker_input(p, p.get("lat"), p.get("lon")) for p in saved]
-        # Replay straight into the tracker, never through the DM code, so
-        # nothing already announced gets announced again.
-        for point in sorted((p for p in inputs if p), key=lambda p: p[2]):
-            tracker.process_point(*point)
+        replay_points(tracker, saved)
     except Exception:
         logger.exception("Recovery: failed - starting this trip fresh")
         tracker.reset()
@@ -337,6 +395,7 @@ def recover_run(trip):
     goal = admin_state["goal_distance_miles"]
     tracker.goal_half_notified = bool(goal) and distance >= goal / 2
     tracker.goal_notified = bool(goal) and distance >= goal
+    tracker.test_mode_used = tracker.test_mode_used or bool(test_mode)
     trip_announced = True
     try:
         db.set_algorithm_version(run_id, ALGORITHM_VERSION)  # replay just recomputed it with this version
@@ -379,11 +438,12 @@ def finish_recording(summary, ended_at, goal_reached):
     if recording["buffer"]:
         logger.error("DB: run %s lost %d unsaved points at trip end", run_id, len(recording["buffer"]))
     try:
-        db.finish_run(run_id, to_utc_naive(ended_at), summary, goal_reached)
+        db.finish_run(run_id, to_utc_naive(ended_at), summary, goal_reached, summary["test_mode_used"])
         logger.info("DB: run %s completed (%.2f mi, %d splits)", run_id, summary["distance_miles"], len(summary["splits"]))
     except Exception:
         logger.exception("DB: run %s couldn't be marked completed - raw points are saved, summary is not", run_id)
     stop_recording()
+    run_in_background(refresh_best_mile)  # this run may hold the new record
 
 
 def is_authorized(auth_header: str) -> bool:
@@ -420,9 +480,39 @@ def validate_target_pace(value):
     return value
 
 
-def build_status_payload(stats):
+def record_status(splits, run_id, counts_for_records):
+    """(the fastest mile ever, for the dashboard card; the mile of the shown run to star, or None).
+
+    The shown run's fastest mile takes the record if it beats the saved one
+    (strictly - a tie stays with whoever set it first), or if it already is
+    the saved one. Test-mode runs never count.
+    """
+    saved = best_mile["record"]
+    eligible = [s for s in splits if s["pace_seconds"] >= MIN_RECORD_PACE_SECONDS] if counts_for_records else []
+    fastest = min(eligible, key=lambda s: s["pace_seconds"], default=None)  # earliest mile wins a tie
+    if fastest and (
+        saved is None
+        or fastest["pace_seconds"] < saved["pace_seconds"]
+        or (saved["run_id"] == run_id and saved["mile"] == fastest["mile"])
+    ):
+        return {"pace_display": fastest["pace_display"], "this_run": True, "mile": fastest["mile"], "date_display": None}, fastest["mile"]
+    if saved:
+        local_start = saved["started_at"] + timedelta(minutes=saved["utc_offset_minutes"] or 0)
+        return {
+            "pace_display": format_pace(saved["pace_seconds"]),
+            "this_run": False,
+            "mile": saved["mile"],
+            "date_display": f"{local_start:%b} {local_start.day}, {local_start.year}",
+        }, None
+    return None, None
+
+
+def build_status_payload(stats, run_id=None, counts_for_records=False):
     goal = admin_state["goal_distance_miles"]
     stats = dict(stats)
+    stats.pop("run_id", None)
+    stats.pop("test_mode_used", None)
+    stats["record"], stats["record_mile"] = record_status(stats["splits"], run_id, counts_for_records)
     stats["target_pace_seconds"] = effective_target_pace()
     stats["goal_distance_miles"] = goal
     stats["goal_progress_percent"] = None
@@ -452,8 +542,17 @@ def dashboard():
 
 @app.get("/status")
 def status():
-    stats = tracker.current_stats() if tracker.active else (last_summary or tracker.current_stats())
-    return jsonify(build_status_payload(stats))
+    if PERSISTENCE_ENABLED and not best_mile["loaded"] and time.monotonic() - best_mile["last_attempt"] >= CHUNK_FLUSH_SECONDS:
+        best_mile["last_attempt"] = time.monotonic()
+        run_in_background(refresh_best_mile)  # the startup load failed - retry, at most once a minute
+
+    if tracker.active:
+        stats, run_id, test_mode_used = tracker.current_stats(), recording["run_id"], tracker.test_mode_used
+    elif last_summary:
+        stats, run_id, test_mode_used = last_summary, last_summary.get("run_id"), last_summary.get("test_mode_used", True)
+    else:
+        stats, run_id, test_mode_used = tracker.current_stats(), None, True
+    return jsonify(build_status_payload(stats, run_id, counts_for_records=not test_mode_used))
 
 
 @app.post("/admin/reset")
@@ -574,8 +673,9 @@ def receive_overland_batch():
         if tracker.active:
             log_ping_summary(force=True)  # the trip's last partial minute
             trip_announced = False
-            ended_at, goal_reached = tracker.last_seen_time, tracker.goal_notified
+            ended_at, goal_reached, test_mode_used = tracker.last_seen_time, tracker.goal_notified, tracker.test_mode_used
             last_summary = tracker.end()
+            last_summary.update(run_id=recording["run_id"], test_mode_used=test_mode_used)
             logger.info(
                 "Trip ended. Distance=%.2fmi Splits=%s",
                 last_summary["distance_miles"],
@@ -614,6 +714,8 @@ def receive_overland_batch():
     for lat, lon, timestamp, accuracy, speed in points:
         meters_before = tracker.cumulative_meters if tracker.active else 0.0
         event = tracker.process_point(lat, lon, timestamp, accuracy, speed)
+        if admin_state["discord_test_mode"]:
+            tracker.test_mode_used = True  # on at any point = not a real run, for records
         ping_window["outcomes"][tracker.last_outcome] += 1
         dm_checkpoint_hit = dm_checkpoint_hit or event is not None
 
@@ -696,6 +798,10 @@ def receive_overland_batch():
 
 
 load_settings()
+if PERSISTENCE_ENABLED:
+    # Background, so a slow database can't hold up the app starting.
+    best_mile["last_attempt"] = time.monotonic()  # /status shouldn't start a second load meanwhile
+    run_in_background(startup_from_database)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -105,6 +105,26 @@ class RunTracker:
         self.splits = []
         self.goal_notified = False  # per-trip flags, set by app.py once each goal DM is sent
         self.goal_half_notified = False
+        self.test_mode_used = False  # set by app.py - a run with test mode on at any point never counts for records
+
+    def _snap_to_path(self, lat, lon):
+        """The closest spot on the recent part of the drawn (smoothed) path, so
+        a mile marker sits on the line instead of a few meters off it."""
+        recent = self.path[-6:]
+        if len(recent) < 2:
+            return lat, lon
+        # Flat-earth approximation - fine over the few tens of meters involved.
+        scale = math.cos(math.radians(lat))
+        best, best_dist = (lat, lon), float("inf")
+        for (lat1, lon1), (lat2, lon2) in zip(recent, recent[1:]):
+            dx, dy = (lon2 - lon1) * scale, lat2 - lat1
+            length_sq = dx * dx + dy * dy
+            t = 0.0 if length_sq == 0 else max(0.0, min(1.0, (((lon - lon1) * scale) * dx + (lat - lat1) * dy) / length_sq))
+            p_lat, p_lon = lat1 + dy * t, lon1 + (lon2 - lon1) * t
+            dist = ((p_lon - lon) * scale) ** 2 + (p_lat - lat) ** 2
+            if dist < best_dist:
+                best, best_dist = (p_lat, p_lon), dist
+        return best
 
     def current_stats(self):
         distance_miles = self.cumulative_meters / MILE_METERS
@@ -149,7 +169,14 @@ class RunTracker:
             "current_pace_seconds": round(current_pace_seconds, 1) if current_pace_seconds else None,
             "current_pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "splits": [
-                {"mile": s["mile"], "pace_seconds": round(s["pace_seconds"], 1), "pace_display": s["pace_display"]}
+                {
+                    "mile": s["mile"],
+                    "pace_seconds": round(s["pace_seconds"], 1),
+                    "pace_display": s["pace_display"],
+                    "lat": s["lat"],
+                    "lon": s["lon"],
+                    "at_display": format_duration(s["crossing_moving"]),  # moving time when the mile was finished
+                }
                 for s in self.splits
             ],
             "fastest_split": {"mile": fastest["mile"], "pace_display": fastest["pace_display"]} if fastest else None,
@@ -259,6 +286,10 @@ class RunTracker:
             # against that mile - matches how Strava reports splits.
             split_start_moving = self.splits[-1]["crossing_moving"] if self.splits else 0.0
             split_seconds = crossing_moving - split_start_moving
+            # Where the mile was finished, for the map's mile markers.
+            crossing_lat, crossing_lon = self._snap_to_path(
+                anchor_lat + (lat - anchor_lat) * fraction, anchor_lon + (lon - anchor_lon) * fraction,
+            )
             event = {
                 "type": "split",
                 "mile": self.next_split_mile,
@@ -266,6 +297,8 @@ class RunTracker:
                 "pace_display": format_pace(split_seconds),
                 "crossing_time": crossing_time,
                 "crossing_moving": crossing_moving,
+                "lat": round(crossing_lat, 6),
+                "lon": round(crossing_lon, 6),
             }
             self.splits.append(event)
             self.next_split_mile += 1

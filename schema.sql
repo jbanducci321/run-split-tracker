@@ -34,6 +34,8 @@ CREATE TABLE rst_splits (
     distance_miles DECIMAL(5,3) NOT NULL,             -- 1.000, or the trailing partial
     pace_seconds DECIMAL(6,1) NOT NULL,               -- per mile, based on moving time
     is_partial TINYINT(1) NOT NULL DEFAULT 0,
+    lat DECIMAL(9,6) NULL,                            -- where the mile was finished (map marker);
+    lon DECIMAL(9,6) NULL,                            -- NULL for the partial and for runs saved before these columns
     PRIMARY KEY (id),
     UNIQUE KEY uq_run_mile (run_id, mile_number),
     CONSTRAINT fk_rst_splits_run FOREIGN KEY (run_id) REFERENCES rst_runs (id) ON DELETE CASCADE

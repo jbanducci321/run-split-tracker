@@ -103,16 +103,20 @@ def save_point_chunk(run_id, chunk_index, points):
     ))
 
 
-def finish_run(run_id, ended_at, summary, goal_reached):
-    splits = [(run_id, s["mile"], 1.0, s["pace_seconds"], 0) for s in summary["splits"]]
+MYSQL_UNKNOWN_COLUMN = 1054
+
+
+def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
+    splits = [(run_id, s["mile"], 1.0, s["pace_seconds"], 0, s.get("lat"), s.get("lon")) for s in summary["splits"]]
     partial = summary.get("partial_split")
     if partial:
-        splits.append((run_id, len(summary["splits"]) + 1, partial["distance_miles"], partial["pace_seconds"], 1))
+        splits.append((run_id, len(summary["splits"]) + 1, partial["distance_miles"], partial["pace_seconds"], 1, None, None))
 
     def work(cur):
         cur.execute(
             "UPDATE rst_runs SET status = 'completed', ended_at = %s, distance_miles = %s,"
-            " moving_seconds = %s, elapsed_seconds = %s, avg_pace_seconds = %s, goal_reached = %s"
+            " moving_seconds = %s, elapsed_seconds = %s, avg_pace_seconds = %s, goal_reached = %s,"
+            " test_mode = GREATEST(test_mode, %s)"  # test mode switched on mid-run still marks the run
             " WHERE id = %s",
             (
                 ended_at,
@@ -121,18 +125,73 @@ def finish_run(run_id, ended_at, summary, goal_reached):
                 round(summary["elapsed_seconds"]),
                 summary["average_pace_seconds"],
                 int(goal_reached),
+                int(test_mode_used),
                 run_id,
             ),
         )
-        if splits:
+        if not splits:
+            return
+        try:
+            cur.executemany(
+                "INSERT INTO rst_splits (run_id, mile_number, distance_miles, pace_seconds, is_partial, lat, lon)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON DUPLICATE KEY UPDATE pace_seconds = VALUES(pace_seconds),"
+                " distance_miles = VALUES(distance_miles), lat = VALUES(lat), lon = VALUES(lon)",
+                splits,
+            )
+        except pymysql.err.OperationalError as exc:
+            if exc.args[0] != MYSQL_UNKNOWN_COLUMN:
+                raise
+            # rst_splits doesn't have the lat/lon columns yet - save the splits
+            # without their locations rather than lose the run's summary.
+            logger.warning("DB: rst_splits has no lat/lon columns yet - saving run %s splits without locations", run_id)
             cur.executemany(
                 "INSERT INTO rst_splits (run_id, mile_number, distance_miles, pace_seconds, is_partial)"
                 " VALUES (%s, %s, %s, %s, %s)"
                 " ON DUPLICATE KEY UPDATE pace_seconds = VALUES(pace_seconds),"
                 " distance_miles = VALUES(distance_miles)",
-                splits,
+                [row[:5] for row in splits],
             )
     _transaction(work)
+
+
+def find_latest_completed_run():
+    """(id, test_mode) of the most recently finished run, or None."""
+    def work(cur):
+        cur.execute(
+            "SELECT id, test_mode FROM rst_runs WHERE status = 'completed'"
+            " ORDER BY ended_at DESC, id DESC LIMIT 1"
+        )
+        return cur.fetchone()
+    return _transaction(work)
+
+
+def load_best_mile(min_pace_seconds):
+    """The fastest full mile ever, from real runs only: completed, never in
+    test mode, not manually excluded, and no faster than min_pace_seconds
+    (anything quicker is treated as bad data, not a real mile).
+
+    Returns a dict (pace_seconds, run_id, mile, started_at, utc_offset_minutes) or None.
+    Ties go to the earlier run - whoever set the time first holds the record.
+    """
+    def work(cur):
+        cur.execute(
+            "SELECT s.pace_seconds, s.run_id, s.mile_number, r.started_at, r.utc_offset_minutes"
+            " FROM rst_splits s JOIN rst_runs r ON r.id = s.run_id"
+            " WHERE s.is_partial = 0 AND r.status = 'completed' AND r.test_mode = 0 AND r.excluded = 0"
+            " AND s.pace_seconds >= %s"
+            " ORDER BY s.pace_seconds ASC, r.started_at ASC, s.mile_number ASC LIMIT 1",
+            (min_pace_seconds,),
+        )
+        return cur.fetchone()
+    row = _transaction(work)
+    if not row:
+        return None
+    pace, run_id, mile, started_at, offset = row
+    return {
+        "pace_seconds": float(pace), "run_id": run_id, "mile": mile,
+        "started_at": started_at, "utc_offset_minutes": offset,
+    }
 
 
 CONDITION_COLUMNS = (
