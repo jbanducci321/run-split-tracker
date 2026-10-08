@@ -217,7 +217,31 @@ def save_conditions(run_id, conditions):
                 "UPDATE rst_runs SET utc_offset_minutes = %s WHERE id = %s AND utc_offset_minutes IS NULL",
                 (conditions["utc_offset_minutes"], run_id),
             )
+        if conditions.get("timezone"):
+            try:
+                cur.execute(
+                    "UPDATE rst_runs SET timezone = %s WHERE id = %s AND timezone IS NULL",
+                    (conditions["timezone"], run_id),
+                )
+            except pymysql.err.OperationalError as exc:
+                if exc.args[0] != MYSQL_UNKNOWN_COLUMN:
+                    raise
+                logger.warning("DB: rst_runs has no timezone column yet - run %s time zone not saved", run_id)
     _transaction(work)
+
+
+def load_run_timezone(run_id):
+    """A run's saved time zone name, or None (not saved, or no timezone column yet)."""
+    def work(cur):
+        cur.execute("SELECT timezone FROM rst_runs WHERE id = %s", (run_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    try:
+        return _transaction(work)
+    except pymysql.err.OperationalError as exc:
+        if exc.args[0] != MYSQL_UNKNOWN_COLUMN:
+            raise
+        return None
 
 
 def load_settings(keys):

@@ -106,24 +106,30 @@ class RunTracker:
         self.goal_notified = False  # per-trip flags, set by app.py once each goal DM is sent
         self.goal_half_notified = False
         self.test_mode_used = False  # set by app.py - a run with test mode on at any point never counts for records
+        self.timezone = None  # e.g. "America/Los_Angeles", set by app.py from the start-of-run weather lookup
 
     def _snap_to_path(self, lat, lon):
         """The closest spot on the recent part of the drawn (smoothed) path, so
-        a mile marker sits on the line instead of a few meters off it."""
-        recent = self.path[-6:]
+        a mile marker sits on the line instead of a few meters off it.
+
+        Returns (lat, lon, path_end): path_end is how many path points come
+        before that spot, so path[:path_end] + [spot] is the route up to it.
+        """
+        recent_start = max(0, len(self.path) - 6)
+        recent = self.path[recent_start:]
         if len(recent) < 2:
-            return lat, lon
+            return lat, lon, len(self.path)
         # Flat-earth approximation - fine over the few tens of meters involved.
         scale = math.cos(math.radians(lat))
-        best, best_dist = (lat, lon), float("inf")
-        for (lat1, lon1), (lat2, lon2) in zip(recent, recent[1:]):
+        best, best_dist = None, float("inf")
+        for i, ((lat1, lon1), (lat2, lon2)) in enumerate(zip(recent, recent[1:])):
             dx, dy = (lon2 - lon1) * scale, lat2 - lat1
             length_sq = dx * dx + dy * dy
             t = 0.0 if length_sq == 0 else max(0.0, min(1.0, (((lon - lon1) * scale) * dx + (lat - lat1) * dy) / length_sq))
             p_lat, p_lon = lat1 + dy * t, lon1 + (lon2 - lon1) * t
             dist = ((p_lon - lon) * scale) ** 2 + (p_lat - lat) ** 2
             if dist < best_dist:
-                best, best_dist = (p_lat, p_lon), dist
+                best, best_dist = (p_lat, p_lon, recent_start + i + 1), dist
         return best
 
     def current_stats(self):
@@ -159,6 +165,8 @@ class RunTracker:
         return {
             "active": self.active,
             "paused": paused,
+            "started_at": self.start_time.isoformat() if self.start_time else None,  # first GPS point
+            "timezone": self.timezone,
             "distance_miles": round(distance_miles, 3),
             "elapsed_seconds": elapsed_seconds,
             "elapsed_display": format_duration(elapsed_seconds),
@@ -175,6 +183,9 @@ class RunTracker:
                     "pace_display": s["pace_display"],
                     "lat": s["lat"],
                     "lon": s["lon"],
+                    # The mile's stretch of the map path: the previous marker,
+                    # path[previous path_end:path_end], then this marker.
+                    "path_end": s["path_end"],
                     "at_display": format_duration(s["crossing_moving"]),  # moving time when the mile was finished
                 }
                 for s in self.splits
@@ -287,7 +298,7 @@ class RunTracker:
             split_start_moving = self.splits[-1]["crossing_moving"] if self.splits else 0.0
             split_seconds = crossing_moving - split_start_moving
             # Where the mile was finished, for the map's mile markers.
-            crossing_lat, crossing_lon = self._snap_to_path(
+            crossing_lat, crossing_lon, path_end = self._snap_to_path(
                 anchor_lat + (lat - anchor_lat) * fraction, anchor_lon + (lon - anchor_lon) * fraction,
             )
             event = {
@@ -299,6 +310,7 @@ class RunTracker:
                 "crossing_moving": crossing_moving,
                 "lat": round(crossing_lat, 6),
                 "lon": round(crossing_lon, 6),
+                "path_end": path_end,
             }
             self.splits.append(event)
             self.next_split_mile += 1

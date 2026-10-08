@@ -11,6 +11,7 @@ CREATE TABLE rst_runs (
     started_at DATETIME NOT NULL,                     -- UTC
     ended_at DATETIME NULL,                           -- UTC
     utc_offset_minutes SMALLINT NULL,
+    timezone VARCHAR(64) NULL,                        -- where the run started, e.g. 'America/Los_Angeles'
     distance_miles DECIMAL(6,3) NULL,
     moving_seconds INT NULL,
     elapsed_seconds INT NULL,

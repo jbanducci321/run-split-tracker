@@ -58,6 +58,7 @@ def fetch_current_conditions(lat, lon, timeout=5):
         "weather_code": current.get("weather_code"),
         "is_day": current.get("is_day"),
         "utc_offset_minutes": data["utc_offset_seconds"] // 60 if "utc_offset_seconds" in data else None,
+        "timezone": data.get("timezone"),  # e.g. "America/Los_Angeles" - where the run is, from "timezone": "auto"
     }
 
 

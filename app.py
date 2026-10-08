@@ -190,9 +190,20 @@ def target_note(pace_seconds):
     return f" ({gap} {'slower' if diff > 0 else 'faster'} than target)"
 
 
-def announce_trip_start(run_id, lat, lon, goal, target):
+def apply_run_timezone(started, timezone_name):
+    """Give the run that started at `started` its time zone - whether it's
+    still going or (if the weather lookup was slow) already finished."""
+    if tracker.active and tracker.start_time == started:
+        tracker.timezone = timezone_name
+    elif last_summary and last_summary.get("started_at") == started.isoformat():
+        last_summary["timezone"] = timezone_name
+
+
+def announce_trip_start(run_id, started, lat, lon, goal, target):
     """Background: fetch start weather, send the 'Tracking started' DM, save the conditions."""
     conditions = weather.fetch_current_conditions(lat, lon)
+    if conditions and conditions.get("timezone"):
+        apply_run_timezone(started, conditions["timezone"])
     message = "Tracking started"
     if conditions:
         message += f" - {weather.describe(conditions)}"
@@ -319,6 +330,7 @@ def restore_last_run():
         saved, _ = db.load_points(run_id)
         rebuilt = RunTracker()
         replay_points(rebuilt, saved)
+        rebuilt.timezone = db.load_run_timezone(run_id)
         summary = rebuilt.end()
     except Exception:
         logger.exception("Startup: couldn't restore the last run to the dashboard")
@@ -377,6 +389,7 @@ def recover_run(trip):
         run_id, goal, target, test_mode = found
         saved, next_chunk = db.load_points(run_id)
         replay_points(tracker, saved)
+        tracker.timezone = db.load_run_timezone(run_id)  # the weather lookup isn't redone for a resumed run
     except Exception:
         logger.exception("Recovery: failed - starting this trip fresh")
         tracker.reset()
@@ -788,7 +801,10 @@ def receive_overland_batch():
         start_lat, start_lon = tracker.path[0]
         announce_thread = threading.Thread(
             target=announce_trip_start,
-            args=(recording["run_id"], start_lat, start_lon, admin_state["goal_distance_miles"], effective_target_pace()),
+            args=(
+                recording["run_id"], tracker.start_time, start_lat, start_lon,
+                admin_state["goal_distance_miles"], effective_target_pace(),
+            ),
             daemon=True,
         )
         announce_thread.start()
