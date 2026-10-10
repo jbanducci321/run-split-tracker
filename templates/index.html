@@ -72,11 +72,18 @@
   <div class="container py-3 py-md-5">
     <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
       <div>
+        {% if run_id %}
+        <h1 class="h3 mb-0"><a href="/" class="link-light text-decoration-none">Run Split Tracker</a></h1>
+        {% else %}
         <h1 class="h3 mb-0">Run Split Tracker</h1>
+        {% endif %}
         <div id="run-time" class="run-time small" hidden></div>
+        <div id="run-weather" class="run-time small" hidden></div>
       </div>
       <span id="status-badge" class="badge bg-secondary fs-6">Loading...</span>
     </div>
+
+    <div id="run-error" class="alert alert-secondary" hidden></div>
 
     <div class="row g-2 g-md-3 mb-4">
       <div class="col-6 col-md-3">
@@ -163,8 +170,18 @@
       </ul>
     </div>
 
-    <div>
-      <button id="admin-login-btn" class="btn btn-sm btn-outline-secondary">Admin Login</button>
+    {% if run_id %}
+    <div class="d-flex gap-2 flex-wrap">
+      <a href="/runs" class="btn btn-sm btn-outline-secondary">&larr; All runs</a>
+      <a href="/" class="btn btn-sm btn-outline-secondary">Live dashboard</a>
+    </div>
+    {% endif %}
+
+    <div {% if run_id %}hidden{% endif %}>
+      <div class="d-flex gap-2 flex-wrap">
+        <button id="admin-login-btn" class="btn btn-sm btn-outline-secondary">Admin Login</button>
+        <a href="/runs" class="btn btn-sm btn-outline-secondary">Past Runs</a>
+      </div>
 
       <div id="admin-login-box" class="card bg-secondary-subtle text-dark mt-2" style="max-width: 360px;" hidden>
         <form id="admin-login-form" class="card-body">
@@ -249,6 +266,11 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
+    // Set when this page shows one saved run (/runs/<id>) instead of the live
+    // dashboard: it loads once, and the map shows the whole route instead of
+    // following the runner.
+    const RUN_ID = {{ run_id | tojson }};
+
     // If the map library fails to load (CDN down, blocked), the map stays
     // blank but everything else on the page keeps updating.
     const mapReady = typeof L !== 'undefined';
@@ -270,7 +292,7 @@
     // Follow mode, like Apple Maps' location button: the map stays locked on
     // the runner until a viewer moves or zooms it, then roams freely until
     // they tap the button or leave the map alone for RELOCK_AFTER_MS.
-    let following = true;
+    let following = !RUN_ID;
     let relockTimer = null;
     let glideUntil = 0;  // don't interrupt the relock glide with a follow pan
     let followButton = null;
@@ -287,6 +309,7 @@
     // Only called for the viewer's own touches, clicks, scrolls and key
     // presses - never for the map's own follow movements.
     function onViewerMovedMap() {
+      if (RUN_ID) return;  // a past run never follows, so there's nothing to unlock or relock
       following = false;
       glideUntil = 0;
       clearTimeout(relockTimer);
@@ -332,8 +355,10 @@
           return wrap;
         },
       });
-      map.addControl(new FollowControl());
-      updateFollowButton();
+      if (!RUN_ID) {
+        map.addControl(new FollowControl());
+        updateFollowButton();
+      }
 
       // What counts as the viewer moving the map. Leaflet's generic move/zoom
       // events also fire for the follow pans, so they can't be used here.
@@ -378,6 +403,11 @@
         currentMarker.setLatLng(last);
       }
 
+      if (RUN_ID && !mapCentered) {
+        map.fitBounds(routeLine.getBounds(), { padding: [24, 24], animate: false });  // the whole route
+        mapCentered = true;
+        return;
+      }
       if (!following || Date.now() < glideUntil) return;
       if (!mapCentered) {
         map.setView(last, STREET_ZOOM, { animate: false });
@@ -564,7 +594,7 @@
           timeZone, weekday: 'short', month: 'short', day: 'numeric',
           ...(yearOf(started) !== yearOf(new Date()) ? { year: 'numeric' } : {}),
         }).format(started);
-        line.textContent = `Last run: ${day} · ${time}`;
+        line.textContent = RUN_ID ? `${day} · ${time}` : `Last run: ${day} · ${time}`;
       }
       line.hidden = false;
     }
@@ -754,13 +784,37 @@
 
     window.addEventListener('resize', renderPaceChart);
 
+    function showRunError(message) {
+      const box = document.getElementById('run-error');
+      box.textContent = message;
+      box.hidden = false;
+      const badge = document.getElementById('status-badge');
+      badge.textContent = 'Unavailable';
+      badge.className = 'badge fs-6 bg-secondary';
+    }
+
     async function refresh() {
       try {
-        const res = await fetch('/status');
-        const data = await res.json();
+        // A saved admin password lets this open runs the public list hides (reset, interrupted).
+        const savedPassword = sessionStorage.getItem('adminPassword');
+        const res = RUN_ID
+          ? await fetch(`/api/runs/${RUN_ID}`, { headers: savedPassword ? { 'X-Admin-Password': savedPassword } : {} })
+          : await fetch('/status');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          if (RUN_ID) showRunError(data.error || "Couldn't load this run.");
+          return;
+        }
+        document.getElementById('run-error').hidden = true;
 
         const badge = document.getElementById('status-badge');
-        if (data.active && data.paused) {
+        if (RUN_ID) {
+          badge.textContent = 'Past run';
+          badge.className = 'badge fs-6 bg-secondary';
+          const weatherLine = document.getElementById('run-weather');
+          weatherLine.textContent = data.weather_display ? `Start: ${data.weather_display}` : '';
+          weatherLine.hidden = !data.weather_display;
+        } else if (data.active && data.paused) {
           badge.textContent = 'Paused';
           badge.className = 'badge fs-6 bg-warning text-dark';
         } else {
@@ -812,11 +866,12 @@
           : '<li class="list-group-item text-muted">No splits yet</li>';
       } catch (err) {
         console.error('status refresh failed', err);
+        if (RUN_ID) showRunError("Couldn't load this run - check your connection and refresh.");
       }
     }
 
     refresh();
-    setInterval(refresh, 3000);
+    if (!RUN_ID) setInterval(refresh, 3000);  // a saved run doesn't change, so it loads once
 
     // --- Admin panel: fully hidden and inert until the correct password is
     // entered. This is a UX gate, not the real security boundary - the
@@ -1079,7 +1134,7 @@
 
     // If a password was already unlocked earlier this browser session, skip
     // straight to the panel instead of prompting again.
-    if (adminPassword) {
+    if (adminPassword && !RUN_ID) {
       callAdminSettings({}).then(({ ok, data }) => {
         if (ok) {
           fillAdminControls(data);

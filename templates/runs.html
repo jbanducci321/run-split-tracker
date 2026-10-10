@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Past Runs</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .stat-value { font-size: clamp(1.05rem, 5vw, 1.5rem); }
+    .run-sketch { flex-shrink: 0; background: #f8f9fa; border-radius: 0.375rem; }
+    .run-sketch polyline { fill: none; stroke: #0d6efd; stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+    .run-sketch circle { fill: #dc3545; }
+    .record-star path { fill: #ffc107; stroke: #212529; stroke-width: 1.3; stroke-linejoin: round; }
+    .run-card:hover { box-shadow: 0 0 0 2px #0d6efd; }
+    .run-card .btn-delete { position: relative; z-index: 2; }  /* above the card-wide link */
+    .run-meta { color: #495057; }
+    .min-w-0 { min-width: 0; }
+  </style>
+</head>
+<body class="bg-dark text-light">
+  <div class="container py-3 py-md-5" style="max-width: 760px;">
+    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+      <h1 class="h3 mb-0">Past Runs</h1>
+      <a href="/" class="btn btn-sm btn-outline-light">&larr; Live dashboard</a>
+    </div>
+
+    <div id="totals" class="row g-2 g-md-3 mb-4" hidden>
+      <div class="col-6 col-md-3">
+        <div class="card bg-secondary-subtle text-dark h-100"><div class="card-body text-center">
+          <div class="text-muted small">Runs</div><div id="total-runs" class="stat-value fw-bold"></div>
+        </div></div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card bg-secondary-subtle text-dark h-100"><div class="card-body text-center">
+          <div class="text-muted small">Total</div><div id="total-miles" class="stat-value fw-bold"></div>
+        </div></div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card bg-secondary-subtle text-dark h-100"><div class="card-body text-center">
+          <div class="text-muted small">This week</div><div id="week-miles" class="stat-value fw-bold"></div>
+        </div></div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card bg-secondary-subtle text-dark h-100"><div class="card-body text-center">
+          <div class="text-muted small">This month</div><div id="month-miles" class="stat-value fw-bold"></div>
+        </div></div>
+      </div>
+    </div>
+
+    <div id="admin-bar" class="card bg-secondary-subtle text-dark mb-3" hidden>
+      <div class="card-body py-2 d-flex align-items-center gap-2 flex-wrap">
+        <span class="fw-semibold me-auto">Admin</span>
+        <button id="delete-test-btn" class="btn btn-sm btn-outline-danger"></button>
+        <button id="admin-lock-btn" class="btn btn-sm btn-outline-secondary">Lock</button>
+      </div>
+    </div>
+    <div id="page-status" class="small mb-3" hidden></div>
+
+    <div id="runs-list" aria-live="polite">
+      <div class="text-secondary">Loading runs...</div>
+    </div>
+
+    <div class="mt-4">
+      <button id="admin-login-btn" class="btn btn-sm btn-outline-secondary">Admin Login</button>
+      <div id="admin-login-box" class="card bg-secondary-subtle text-dark mt-2" style="max-width: 360px;" hidden>
+        <form id="admin-login-form" class="card-body">
+          <div class="input-group">
+            <input type="password" id="admin-password" class="form-control" placeholder="Admin password" autocomplete="current-password">
+            <button type="submit" class="btn btn-primary">Unlock</button>
+          </div>
+          <div id="admin-login-error" class="small text-danger mt-2"></div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const HOME_TIMEZONE = 'America/Los_Angeles';
+    const STAR_PATH = 'M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z';
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const STATUS_LABELS = { active: 'Recording', reset: 'Reset', interrupted: 'Interrupted' };
+
+    // Shared with the dashboard: unlocking on either page unlocks both (this tab only).
+    let adminPassword = sessionStorage.getItem('adminPassword') || '';
+    let runs = [];
+    let isAdmin = false;
+    let recordingRunId = null;
+    const sketches = new Map();  // run id -> [[lat, lon], ...]
+
+    function el(tag, attrs = {}, children = []) {
+      const node = document.createElement(tag);
+      for (const [key, value] of Object.entries(attrs)) {
+        if (key === 'text') node.textContent = value;
+        else node.setAttribute(key, value);
+      }
+      for (const child of [].concat(children)) if (child) node.appendChild(child);
+      return node;
+    }
+
+    function zoneOf(run) {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: run.timezone || HOME_TIMEZONE });
+        return run.timezone || HOME_TIMEZONE;
+      } catch (err) {
+        return HOME_TIMEZONE;
+      }
+    }
+
+    // "Wed, Oct 7 · 3:23 PM PDT", in the time zone where the run started.
+    function whenText(run) {
+      const started = new Date(run.started_at);
+      if (isNaN(started)) return 'Unknown date';
+      const timeZone = zoneOf(run);
+      const yearOf = d => new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric' }).format(d);
+      const day = new Intl.DateTimeFormat('en-US', {
+        timeZone, weekday: 'short', month: 'short', day: 'numeric',
+        ...(yearOf(started) !== yearOf(new Date()) ? { year: 'numeric' } : {}),
+      }).format(started);
+      const time = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(started);
+      return `${day} · ${time}`;
+    }
+
+    function miles(value) {
+      return value == null ? '-' : `${value.toFixed(2)} mi`;
+    }
+
+    function setStatus(message, kind) {
+      const status = document.getElementById('page-status');
+      status.textContent = message;
+      status.className = `small mb-3 ${kind === 'error' ? 'text-danger' : kind === 'ok' ? 'text-success' : 'text-secondary'}`;
+      status.hidden = !message;
+    }
+
+    // Totals count real, finished runs only - even in the admin view.
+    function renderTotals() {
+      const real = runs.filter(r => r.status === 'completed' && !r.test_mode);
+      document.getElementById('totals').hidden = real.length === 0;
+      const now = new Date();
+      const weekStart = new Date(now);
+      weekStart.setHours(0, 0, 0, 0);
+      weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));  // Monday
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      const sum = list => list.reduce((total, r) => total + (r.distance_miles || 0), 0);
+      document.getElementById('total-runs').textContent = real.length;
+      document.getElementById('total-miles').textContent = miles(sum(real));
+      document.getElementById('week-miles').textContent = miles(sum(real.filter(r => new Date(r.started_at) >= weekStart)));
+      document.getElementById('month-miles').textContent = miles(sum(real.filter(r => new Date(r.started_at) >= monthStart)));
+    }
+
+    function drawSketch(svg, points) {
+      svg.replaceChildren();
+      if (!points || points.length < 2) return;
+      const size = 64, pad = 7;
+      const meanLat = points.reduce((t, p) => t + p[0], 0) / points.length;
+      const scale = Math.cos(meanLat * Math.PI / 180);  // keep the route's real proportions
+      const xs = points.map(p => p[1] * scale), ys = points.map(p => p[0]);
+      const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+      const span = Math.max(maxX - minX, maxY - minY) || 1e-9;
+      const k = (size - 2 * pad) / span;
+      const offX = pad + ((size - 2 * pad) - (maxX - minX) * k) / 2;
+      const offY = pad + ((size - 2 * pad) - (maxY - minY) * k) / 2;
+      const coords = xs.map((x, i) => [offX + (x - minX) * k, offY + (maxY - ys[i]) * k]);
+      const line = document.createElementNS(SVG_NS, 'polyline');
+      line.setAttribute('points', coords.map(c => c.map(v => v.toFixed(1)).join(',')).join(' '));
+      svg.appendChild(line);
+      const end = document.createElementNS(SVG_NS, 'circle');
+      const [ex, ey] = coords[coords.length - 1];
+      end.setAttribute('cx', ex.toFixed(1));
+      end.setAttribute('cy', ey.toFixed(1));
+      end.setAttribute('r', 3);
+      svg.appendChild(end);
+    }
+
+    function runCard(run) {
+      const sketch = document.createElementNS(SVG_NS, 'svg');
+      sketch.setAttribute('class', 'run-sketch');
+      sketch.setAttribute('width', 64);
+      sketch.setAttribute('height', 64);
+      sketch.setAttribute('viewBox', '0 0 64 64');
+      sketch.setAttribute('aria-hidden', 'true');
+      sketch.dataset.runId = run.id;
+      if (sketches.has(run.id)) drawSketch(sketch, sketches.get(run.id));
+
+      const title = el('div', { class: 'd-flex align-items-center gap-2 flex-wrap' }, [
+        el('a', { href: `/runs/${run.id}`, class: 'stretched-link link-dark text-decoration-none fw-semibold', text: whenText(run) }),
+      ]);
+      if (run.holds_record) {
+        const star = document.createElementNS(SVG_NS, 'svg');
+        star.setAttribute('class', 'record-star');
+        star.setAttribute('viewBox', '0 0 24 24');
+        star.setAttribute('width', 18);
+        star.setAttribute('height', 18);
+        star.setAttribute('role', 'img');
+        star.setAttribute('aria-label', 'Holds the fastest mile ever');
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', STAR_PATH);
+        star.appendChild(path);
+        title.appendChild(star);
+      }
+      if (run.test_mode) title.appendChild(el('span', { class: 'badge text-bg-warning', text: 'Test' }));
+      if (run.status !== 'completed') {
+        title.appendChild(el('span', { class: 'badge text-bg-secondary', text: STATUS_LABELS[run.status] || run.status }));
+      }
+
+      const stats = [miles(run.distance_miles), run.moving_display, run.average_pace_display].filter(Boolean).join(' · ');
+      const extra = [
+        run.fastest_mile ? `Fastest mile ${run.fastest_mile.pace_display.replace('/mi', '')} (mile ${run.fastest_mile.mile})` : null,
+        run.weather_display,
+      ].filter(Boolean).join(' · ');
+
+      const info = el('div', { class: 'flex-grow-1 min-w-0' }, [
+        title,
+        el('div', { text: stats || 'No summary saved' }),
+        extra ? el('div', { class: 'small run-meta', text: extra }) : null,
+      ]);
+
+      const body = el('div', { class: 'card-body d-flex align-items-center gap-3 position-relative' }, [sketch, info]);
+      if (isAdmin) {
+        const recording = run.id === recordingRunId;
+        const button = el('button', {
+          class: 'btn btn-sm btn-outline-danger btn-delete flex-shrink-0',
+          text: 'Delete',
+          'aria-label': `Delete the run from ${whenText(run)}`,
+        });
+        if (recording) {
+          button.disabled = true;
+          button.title = 'Still being recorded - stop the trip first';
+        }
+        button.addEventListener('click', () => deleteRun(run));
+        body.appendChild(button);
+      }
+      return el('div', { class: 'card bg-secondary-subtle text-dark mb-2 run-card' }, [body]);
+    }
+
+    function render() {
+      renderTotals();
+      const list = document.getElementById('runs-list');
+      list.replaceChildren();
+      if (!runs.length) {
+        list.appendChild(el('div', { class: 'text-secondary', text: "No runs yet - they'll show up here after your first tracked run." }));
+      } else {
+        runs.forEach(run => list.appendChild(runCard(run)));
+      }
+
+      document.getElementById('admin-bar').hidden = !isAdmin;
+      document.getElementById('admin-login-btn').hidden = isAdmin;
+      if (isAdmin) document.getElementById('admin-login-box').hidden = true;
+      const testCount = runs.filter(r => r.test_mode && r.id !== recordingRunId).length;
+      const bulk = document.getElementById('delete-test-btn');
+      bulk.textContent = testCount ? `Delete all test runs (${testCount})` : 'No test runs';
+      bulk.disabled = testCount === 0;
+    }
+
+    // Thumbnails load one at a time, newest first, so the server never gets
+    // a pile of requests at once.
+    async function loadSketches() {
+      for (const run of runs) {
+        if (sketches.has(run.id)) continue;
+        try {
+          const res = await fetch(`/api/runs/${run.id}/sketch`, { headers: adminHeaders() });
+          if (!res.ok) continue;
+          const data = await res.json();
+          sketches.set(run.id, data.points);
+          const svg = document.querySelector(`.run-sketch[data-run-id="${run.id}"]`);
+          if (svg) drawSketch(svg, data.points);
+        } catch (err) {
+          console.error('route sketch failed', run.id, err);
+        }
+      }
+    }
+
+    function adminHeaders() {
+      return adminPassword ? { 'X-Admin-Password': adminPassword } : {};
+    }
+
+    async function loadRuns() {
+      try {
+        const res = await fetch('/api/runs', { headers: adminHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          document.getElementById('runs-list').replaceChildren(
+            el('div', { class: 'text-danger', text: data.error || "Couldn't load runs." }));
+          return;
+        }
+        runs = data.runs;
+        isAdmin = data.admin;
+        recordingRunId = data.recording_run_id;
+        if (adminPassword && !isAdmin) lockAdmin();  // saved password no longer works
+        render();
+        loadSketches();
+      } catch (err) {
+        console.error('loading runs failed', err);
+        document.getElementById('runs-list').replaceChildren(
+          el('div', { class: 'text-danger', text: "Couldn't load runs - check your connection and refresh." }));
+      }
+    }
+
+    async function adminPost(url) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) {
+        lockAdmin();
+        render();
+      }
+      return { ok: res.ok, data };
+    }
+
+    async function deleteRun(run) {
+      const label = `${whenText(run)} (${miles(run.distance_miles)})`;
+      if (!confirm(`Permanently delete the run from ${label}?\n\nThis removes its GPS points, splits and weather from the database. It can't be undone.`)) return;
+      try {
+        const { ok, data } = await adminPost(`/admin/runs/${run.id}/delete`);
+        if (!ok) {
+          setStatus(data.error || "Couldn't delete the run.", 'error');
+          return;
+        }
+        runs = runs.filter(r => r.id !== run.id);
+        render();
+        setStatus(`Deleted the run from ${label}.`, 'ok');
+        loadRuns();  // the fastest-mile star may have moved to another run
+      } catch (err) {
+        console.error('delete failed', err);
+        setStatus('Delete failed - check your connection.', 'error');
+      }
+    }
+
+    document.getElementById('delete-test-btn').addEventListener('click', async () => {
+      const count = runs.filter(r => r.test_mode && r.id !== recordingRunId).length;
+      if (!count) return;
+      const which = count === 1 ? 'the 1 test run' : `all ${count} test runs`;
+      if (!confirm(`Permanently delete ${which}?\n\nThis removes their GPS points, splits and weather from the database. It can't be undone.`)) return;
+      try {
+        const { ok, data } = await adminPost('/admin/runs/delete-test');
+        if (!ok) {
+          setStatus(data.error || "Couldn't delete the test runs.", 'error');
+          return;
+        }
+        setStatus(`Deleted ${data.deleted.length} test run${data.deleted.length === 1 ? '' : 's'}.`, 'ok');
+        loadRuns();
+      } catch (err) {
+        console.error('bulk delete failed', err);
+        setStatus('Delete failed - check your connection.', 'error');
+      }
+    });
+
+    function lockAdmin() {
+      adminPassword = '';
+      sessionStorage.removeItem('adminPassword');
+      isAdmin = false;
+    }
+
+    document.getElementById('admin-lock-btn').addEventListener('click', () => {
+      lockAdmin();
+      setStatus('', '');
+      loadRuns();
+    });
+
+    document.getElementById('admin-login-btn').addEventListener('click', () => {
+      document.getElementById('admin-login-box').hidden = false;
+      document.getElementById('admin-password').focus();
+    });
+
+    document.getElementById('admin-login-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const input = document.getElementById('admin-password');
+      const error = document.getElementById('admin-login-error');
+      try {
+        // Same check the dashboard's login uses (an empty settings update).
+        const res = await fetch('/admin/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: input.value }),
+        });
+        if (!res.ok) {
+          error.textContent = res.status === 401 ? 'Incorrect password.' : 'Login failed.';
+          return;
+        }
+        adminPassword = input.value;
+        sessionStorage.setItem('adminPassword', adminPassword);
+        input.value = '';
+        error.textContent = '';
+        loadRuns();
+      } catch (err) {
+        console.error('admin login failed', err);
+        error.textContent = 'Request failed - check your connection.';
+      }
+    });
+
+    loadRuns();
+  </script>
+</body>
+</html>

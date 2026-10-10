@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from datetime import timedelta, timezone
 
 from dotenv import load_dotenv
@@ -216,7 +216,7 @@ def announce_trip_start(run_id, started, lat, lon, goal, target):
     if not (PERSISTENCE_ENABLED and conditions):
         return
     if run_id is None:
-        logger.warning("Weather: not saved - the run row wasn't created yet")
+        logger.info("Weather: not saved - test run, or the run row wasn't created yet")
         return
     try:
         db.save_conditions(run_id, conditions)
@@ -440,6 +440,20 @@ def stop_recording():
     recording.update(run_id=None, buffer=[], chunk_index=0, last_db_attempt=float("-inf"))
 
 
+def discard_test_run():
+    """Test runs are never saved. If test mode was switched on after this
+    run's row was already created, delete it (and everything saved with it)."""
+    run_id = recording["run_id"]
+    if run_id is not None:
+        try:
+            db.delete_run(run_id)
+            logger.info("DB: run %s deleted - test mode was turned on, and test runs aren't saved", run_id)
+        except Exception:
+            logger.exception("DB: couldn't delete test run %s - delete it from Past Runs", run_id)
+        run_cache.pop(run_id, None)
+    stop_recording()
+
+
 def finish_recording(summary, ended_at, goal_reached):
     run_id = recording["run_id"]
     if run_id is None:
@@ -500,6 +514,8 @@ def record_status(splits, run_id, counts_for_records):
     (strictly - a tie stays with whoever set it first), or if it already is
     the saved one. Test-mode runs never count.
     """
+    if PERSISTENCE_ENABLED and not best_mile["loaded"]:
+        return None, None  # the saved record isn't known yet - don't guess at a star
     saved = best_mile["record"]
     eligible = [s for s in splits if s["pace_seconds"] >= MIN_RECORD_PACE_SECONDS] if counts_for_records else []
     fastest = min(eligible, key=lambda s: s["pace_seconds"], default=None)  # earliest mile wins a tie
@@ -520,13 +536,20 @@ def record_status(splits, run_id, counts_for_records):
     return None, None
 
 
-def build_status_payload(stats, run_id=None, counts_for_records=False):
-    goal = admin_state["goal_distance_miles"]
+CURRENT_SETTINGS = object()  # build_status_payload default: use today's admin goal/target
+
+
+def build_status_payload(stats, run_id=None, counts_for_records=False, goal=CURRENT_SETTINGS, target=CURRENT_SETTINGS):
+    """The dashboard's JSON. A past run passes the goal/target it was run with."""
+    if goal is CURRENT_SETTINGS:
+        goal = admin_state["goal_distance_miles"]
+    if target is CURRENT_SETTINGS:
+        target = effective_target_pace()
     stats = dict(stats)
     stats.pop("run_id", None)
     stats.pop("test_mode_used", None)
     stats["record"], stats["record_mile"] = record_status(stats["splits"], run_id, counts_for_records)
-    stats["target_pace_seconds"] = effective_target_pace()
+    stats["target_pace_seconds"] = target
     stats["goal_distance_miles"] = goal
     stats["goal_progress_percent"] = None
     stats["eta_display"] = None
@@ -536,7 +559,7 @@ def build_status_payload(stats, run_id=None, counts_for_records=False):
 
         remaining_miles = goal - stats["distance_miles"]
         moving = stats["moving_seconds"] or 0
-        if remaining_miles > 0 and stats["distance_miles"] > 0.01 and moving > 0:
+        if stats["active"] and remaining_miles > 0 and stats["distance_miles"] > 0.01 and moving > 0:
             average_pace_seconds = moving / stats["distance_miles"]
             stats["eta_display"] = format_duration(remaining_miles * average_pace_seconds)
 
@@ -550,7 +573,207 @@ def health():
 
 @app.get("/")
 def dashboard():
-    return render_template("index.html")
+    return render_template("index.html", run_id=None)
+
+
+# --- Past runs. Public, like the dashboard; deleting needs the admin password.
+
+# Finished runs never change, so their rebuilt summaries are kept for reuse.
+RUN_CACHE_SIZE = 20
+run_cache = OrderedDict()  # run id -> summary rebuilt from saved points
+SKETCH_POINTS = 120  # route thumbnail on the Past Runs list - just the shape
+
+
+def request_is_admin():
+    """Read-only admin views send the password in a header (GET has no body)."""
+    return is_admin_password_correct(request.headers.get("X-Admin-Password", ""))
+
+
+def iso_utc(naive_utc):
+    return naive_utc.replace(tzinfo=timezone.utc).isoformat() if naive_utc else None
+
+
+def number(value):
+    return float(value) if value is not None else None
+
+
+def run_weather_display(row):
+    if row["temperature_f"] is None and row["weather_code"] is None:
+        return None
+    return weather.describe({
+        "temperature_f": number(row["temperature_f"]),
+        "weather_code": row["weather_code"],
+        "wind_mph": number(row["wind_mph"]),
+        "wind_direction_deg": number(row["wind_direction_deg"]),
+    }) or None
+
+
+def run_list_item(row):
+    record = best_mile["record"]
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "test_mode": bool(row["test_mode"]),
+        "started_at": iso_utc(row["started_at"]),
+        "timezone": row["timezone"],
+        "distance_miles": number(row["distance_miles"]),
+        "moving_display": format_duration(row["moving_seconds"]) if row["moving_seconds"] is not None else None,
+        "average_pace_display": format_pace(float(row["avg_pace_seconds"])) if row["avg_pace_seconds"] else None,
+        "fastest_mile": {
+            "mile": row["fastest_mile"], "pace_display": format_pace(float(row["fastest_pace_seconds"])),
+        } if row["fastest_pace_seconds"] is not None else None,
+        "weather_display": run_weather_display(row),
+        "holds_record": bool(record and record["run_id"] == row["id"]),
+    }
+
+
+def visible_run(run_id):
+    """(the run's row, None), or (None, an error response). The public sees
+    finished real runs; the admin sees every run."""
+    if not PERSISTENCE_ENABLED:
+        return None, (jsonify(error="Past runs need the database, which isn't set up."), 503)
+    try:
+        row = db.get_run(run_id)
+    except Exception:
+        logger.exception("Past runs: couldn't load run %s", run_id)
+        return None, (jsonify(error="Couldn't reach the database - try again shortly."), 503)
+    if not row or not (request_is_admin() or (row["status"] == "completed" and not row["test_mode"])):
+        return None, (jsonify(error="Run not found."), 404)
+    return row, None
+
+
+def rebuilt_run(run_id, row):
+    """A saved run replayed through the tracker - the same numbers, map and
+    mile markers it had live."""
+    if run_id in run_cache:
+        run_cache.move_to_end(run_id)
+        return run_cache[run_id]
+    saved, _ = db.load_points(run_id)
+    rebuilt = RunTracker()
+    replay_points(rebuilt, saved)
+    rebuilt.timezone = row["timezone"]
+    summary = rebuilt.end()
+    if row["status"] == "completed":  # anything else may still change
+        run_cache[run_id] = summary
+        while len(run_cache) > RUN_CACHE_SIZE:
+            run_cache.popitem(last=False)
+    return summary
+
+
+def route_sketch(path):
+    """Evenly spaced points along the route, enough to draw its shape."""
+    if len(path) > SKETCH_POINTS:
+        step = (len(path) - 1) / (SKETCH_POINTS - 1)
+        path = [path[round(i * step)] for i in range(SKETCH_POINTS)]
+    return [[round(lat, 5), round(lon, 5)] for lat, lon in path]
+
+
+@app.get("/runs")
+def runs_page():
+    return render_template("runs.html")
+
+
+@app.get("/runs/<int:run_id>")
+def run_page(run_id):
+    return render_template("index.html", run_id=run_id)  # the dashboard, showing one saved run
+
+
+@app.get("/api/runs")
+def api_runs():
+    if not PERSISTENCE_ENABLED:
+        return jsonify(error="Past runs need the database, which isn't set up."), 503
+    admin = request_is_admin()
+    try:
+        rows = db.list_runs(include_all=admin)
+    except Exception:
+        logger.exception("Past runs: couldn't load the list")
+        return jsonify(error="Couldn't reach the database - try again shortly."), 503
+    return jsonify(
+        runs=[run_list_item(row) for row in rows],
+        admin=admin,
+        recording_run_id=recording["run_id"] if admin else None,
+    )
+
+
+@app.get("/api/runs/<int:run_id>")
+def api_run(run_id):
+    row, error = visible_run(run_id)
+    if error:
+        return error
+    try:
+        summary = rebuilt_run(run_id, row)
+    except Exception:
+        logger.exception("Past runs: couldn't rebuild run %s", run_id)
+        return jsonify(error="Couldn't load this run's GPS points - try again shortly."), 503
+    payload = build_status_payload(
+        summary, run_id, counts_for_records=not row["test_mode"],
+        goal=number(row["goal_distance_miles"]), target=row["target_pace_seconds"],
+    )
+    payload.update(run_id=run_id, status=row["status"], weather_display=run_weather_display(row))
+    return jsonify(payload)
+
+
+@app.get("/api/runs/<int:run_id>/sketch")
+def api_run_sketch(run_id):
+    row, error = visible_run(run_id)
+    if error:
+        return error
+    try:
+        summary = rebuilt_run(run_id, row)
+    except Exception:
+        logger.exception("Past runs: couldn't rebuild run %s for its sketch", run_id)
+        return jsonify(error="Couldn't load this run's GPS points."), 503
+    return jsonify(points=route_sketch(summary["path"]))
+
+
+def after_runs_deleted(run_ids):
+    """Keep what's on screen in step with the database after a delete."""
+    global last_summary
+    for run_id in run_ids:
+        run_cache.pop(run_id, None)
+    if last_summary and last_summary.get("run_id") in run_ids:
+        last_summary = None  # the dashboard was showing a deleted run - show the next most recent
+        run_in_background(startup_from_database)  # also rechecks the record
+    else:
+        run_in_background(refresh_best_mile)  # a deleted run may have held the record
+
+
+@app.post("/admin/runs/<int:run_id>/delete")
+def admin_delete_run(run_id):
+    data = request.get_json(silent=True) or {}
+    if not is_admin_password_correct(data.get("password", "")):
+        return jsonify(error="unauthorized"), 401
+    if not PERSISTENCE_ENABLED:
+        return jsonify(error="No database is set up."), 503
+    if run_id == recording["run_id"]:
+        return jsonify(error="That run is still being recorded - stop the trip in Overland first."), 409
+    try:
+        existed = db.delete_run(run_id)
+    except Exception:
+        logger.exception("Admin: couldn't delete run %s", run_id)
+        return jsonify(error="Couldn't reach the database - nothing was deleted."), 503
+    if not existed:
+        return jsonify(error="That run doesn't exist (already deleted?)."), 404
+    logger.warning("Admin: permanently deleted run %s", run_id)
+    after_runs_deleted([run_id])
+    return jsonify(deleted=[run_id])
+
+
+@app.post("/admin/runs/delete-test")
+def admin_delete_test_runs():
+    data = request.get_json(silent=True) or {}
+    if not is_admin_password_correct(data.get("password", "")):
+        return jsonify(error="unauthorized"), 401
+    if not PERSISTENCE_ENABLED:
+        return jsonify(error="No database is set up."), 503
+    try:
+        deleted = db.delete_test_runs(recording["run_id"])
+    except Exception:
+        logger.exception("Admin: couldn't delete test runs")
+        return jsonify(error="Couldn't reach the database - nothing was deleted."), 503
+    logger.warning("Admin: permanently deleted %d test run(s): %s", len(deleted), deleted)
+    after_runs_deleted(deleted)
+    return jsonify(deleted=deleted)
 
 
 @app.get("/status")
@@ -687,14 +910,17 @@ def receive_overland_batch():
             log_ping_summary(force=True)  # the trip's last partial minute
             trip_announced = False
             ended_at, goal_reached, test_mode_used = tracker.last_seen_time, tracker.goal_notified, tracker.test_mode_used
+            if test_mode_used:
+                discard_test_run()  # normally already done mid-run; this catches a run that ended first
             last_summary = tracker.end()
             last_summary.update(run_id=recording["run_id"], test_mode_used=test_mode_used)
             logger.info(
-                "Trip ended. Distance=%.2fmi Splits=%s",
+                "Trip ended. Distance=%.2fmi Splits=%s%s",
                 last_summary["distance_miles"],
                 [s["pace_display"] for s in last_summary["splits"]],
+                " (test run - not saved)" if test_mode_used else "",
             )
-            if PERSISTENCE_ENABLED:
+            if PERSISTENCE_ENABLED and not test_mode_used:
                 finish_recording(last_summary, ended_at, goal_reached)
         return jsonify(result="ok")
 
@@ -702,7 +928,7 @@ def receive_overland_batch():
         load_settings()  # a trip is starting - make sure its goal/target are the saved ones
         recover_run(payload.get("trip"))  # no-op unless this trip was cut off by a restart
 
-    if PERSISTENCE_ENABLED:
+    if PERSISTENCE_ENABLED and not admin_state["discord_test_mode"] and not tracker.test_mode_used:
         recording["buffer"].extend(db.raw_point(feature) for feature in locations)
 
     points = []
@@ -791,8 +1017,11 @@ def receive_overland_batch():
             send_dm(f"Goal reached! {goal:.2f} mi")
 
     if PERSISTENCE_ENABLED and tracker.active:
-        ensure_run_recorded()
-        flush_points(force=dm_checkpoint_hit)
+        if tracker.test_mode_used:
+            discard_test_run()  # test mode on at any point = a test run, which is never saved
+        else:
+            ensure_run_recorded()
+            flush_points(force=dm_checkpoint_hit)
 
     # First accepted point of a new trip: announce it (weather lookup runs in
     # the background so it can't slow down Overland's request).

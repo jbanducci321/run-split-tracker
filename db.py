@@ -155,11 +155,67 @@ def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
     _transaction(work)
 
 
+RUN_LIST_COLUMNS = (
+    "id", "status", "test_mode", "started_at", "timezone", "distance_miles", "moving_seconds",
+    "avg_pace_seconds", "goal_distance_miles", "target_pace_seconds",
+    "temperature_f", "weather_code", "wind_mph", "wind_direction_deg",
+    "fastest_pace_seconds", "fastest_mile",
+)
+
+
+def _run_rows(where, params):
+    def work(cur):
+        cur.execute(
+            "SELECT r.id, r.status, r.test_mode, r.started_at, r.timezone, r.distance_miles, r.moving_seconds,"
+            " r.avg_pace_seconds, r.goal_distance_miles, r.target_pace_seconds,"
+            " c.temperature_f, c.weather_code, c.wind_mph, c.wind_direction_deg,"
+            " (SELECT s.pace_seconds FROM rst_splits s WHERE s.run_id = r.id AND s.is_partial = 0"
+            "  ORDER BY s.pace_seconds, s.mile_number LIMIT 1),"
+            " (SELECT s.mile_number FROM rst_splits s WHERE s.run_id = r.id AND s.is_partial = 0"
+            "  ORDER BY s.pace_seconds, s.mile_number LIMIT 1)"
+            " FROM rst_runs r LEFT JOIN rst_run_conditions c ON c.run_id = r.id"
+            f" WHERE {where} ORDER BY r.started_at DESC LIMIT 500",
+            params,
+        )
+        return [dict(zip(RUN_LIST_COLUMNS, row)) for row in cur.fetchall()]
+    return _transaction(work)
+
+
+def list_runs(include_all):
+    """Runs for the Past Runs page, newest first: finished ones only, or
+    (include_all, for the admin) every run, whatever its status."""
+    return _run_rows("TRUE" if include_all else "r.status = 'completed' AND r.test_mode = 0", ())
+
+
+def get_run(run_id):
+    """One run's row (same fields as list_runs), or None."""
+    rows = _run_rows("r.id = %s", (run_id,))
+    return rows[0] if rows else None
+
+
+def delete_run(run_id):
+    """Permanently delete a run. Its points, splits and weather go with it
+    (ON DELETE CASCADE). Returns True if it existed."""
+    return _transaction(lambda cur: cur.execute("DELETE FROM rst_runs WHERE id = %s", (run_id,))) > 0
+
+
+def delete_test_runs(keep_run_id):
+    """Permanently delete every test-mode run (except keep_run_id, the one
+    being recorded). Returns the deleted run ids."""
+    def work(cur):
+        cur.execute("SELECT id FROM rst_runs WHERE test_mode = 1 AND id <> %s", (keep_run_id or -1,))
+        ids = [row[0] for row in cur.fetchall()]
+        if ids:
+            cur.execute(f"DELETE FROM rst_runs WHERE id IN ({', '.join(['%s'] * len(ids))})", tuple(ids))
+        return ids
+    return _transaction(work)
+
+
 def find_latest_completed_run():
     """(id, test_mode) of the most recently finished run, or None."""
     def work(cur):
         cur.execute(
-            "SELECT id, test_mode FROM rst_runs WHERE status = 'completed'"
+            "SELECT id, test_mode FROM rst_runs WHERE status = 'completed' AND test_mode = 0"
             " ORDER BY ended_at DESC, id DESC LIMIT 1"
         )
         return cur.fetchone()
