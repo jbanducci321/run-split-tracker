@@ -16,6 +16,8 @@ CREATE TABLE rst_runs (
     moving_seconds INT NULL,
     elapsed_seconds INT NULL,
     avg_pace_seconds DECIMAL(6,1) NULL,               -- per mile, based on moving time
+    elevation_gain_ft SMALLINT NULL,                  -- smoothed phone altitude (see split_tracker.py)
+    elevation_loss_ft SMALLINT NULL,
     goal_distance_miles DECIMAL(4,2) NULL,
     goal_reached TINYINT(1) NOT NULL DEFAULT 0,
     target_pace_seconds SMALLINT NULL,
@@ -34,6 +36,8 @@ CREATE TABLE rst_splits (
     mile_number SMALLINT NOT NULL,
     distance_miles DECIMAL(5,3) NOT NULL,             -- 1.000, or the trailing partial
     pace_seconds DECIMAL(6,1) NOT NULL,               -- per mile, based on moving time
+    elevation_gain_ft SMALLINT NULL,                  -- climbing/descending within this mile
+    elevation_loss_ft SMALLINT NULL,
     is_partial TINYINT(1) NOT NULL DEFAULT 0,
     lat DECIMAL(9,6) NULL,                            -- where the mile was finished (map marker);
     lon DECIMAL(9,6) NULL,                            -- NULL for the partial and for runs saved before these columns

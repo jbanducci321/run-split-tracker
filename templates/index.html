@@ -50,12 +50,13 @@
     #map-legend[hidden] { display: none !important; }  /* its d-flex would otherwise override hidden */
     .stat-value { font-size: clamp(1.05rem, 5vw, 1.5rem); }
 
-    #pace-chart { height: 200px; }
-    #pace-chart svg { display: block; overflow: visible; touch-action: pan-y; }
-    #pace-chart svg:focus { outline: none; }
-    #pace-chart svg:focus-visible { outline: 2px solid #0d6efd; outline-offset: 4px; border-radius: 2px; }
-    #pace-chart .tick { font-size: 11px; fill: #495057; font-variant-numeric: tabular-nums; }
-    #pace-chart .extreme-label { font-size: 11px; font-weight: 600; fill: #212529; }
+    #pace-chart, #elev-chart { height: 200px; }
+    #elev-chart { height: 160px; }
+    #pace-chart svg, #elev-chart svg { display: block; overflow: visible; touch-action: pan-y; }
+    #pace-chart svg:focus, #elev-chart svg:focus { outline: none; }
+    #pace-chart svg:focus-visible, #elev-chart svg:focus-visible { outline: 2px solid #0d6efd; outline-offset: 4px; border-radius: 2px; }
+    #pace-chart .tick, #elev-chart .tick { font-size: 11px; fill: #495057; font-variant-numeric: tabular-nums; }
+    #pace-chart .extreme-label, #elev-chart .extreme-label { font-size: 11px; font-weight: 600; fill: #212529; }
     .pace-tooltip {
       position: absolute; pointer-events: none; white-space: nowrap;
       background: #212529; color: #fff; font-size: 0.8rem;
@@ -92,6 +93,7 @@
           <div class="card-body text-center">
             <div class="text-muted small">Distance</div>
             <div id="stat-distance" class="stat-value fw-bold">-</div>
+            <div id="stat-elevation" class="text-muted small"></div>
           </div>
         </div>
       </div>
@@ -161,6 +163,13 @@
       <div class="card-header">Pace per Mile</div>
       <div class="card-body pb-2">
         <div id="pace-chart" class="position-relative"></div>
+      </div>
+    </div>
+
+    <div id="elev-chart-card" class="card bg-secondary-subtle text-dark mb-4" hidden>
+      <div class="card-header">Elevation</div>
+      <div class="card-body pb-2">
+        <div id="elev-chart" class="position-relative"></div>
       </div>
     </div>
 
@@ -530,8 +539,9 @@
         seen.add(s.mile);
         const kind = s.mile === recordMile ? 'record' : (s.mile === fastestMile ? 'fastest' : 'mile');
         const note = kind === 'record' ? 'Fastest mile ever' : (kind === 'fastest' ? 'Fastest this run' : '');
+        const climb = s.elevation_gain_ft != null ? `<br>↑${s.elevation_gain_ft} ft ↓${s.elevation_loss_ft} ft` : '';
         const tooltip =
-          `<strong>Mile ${s.mile}</strong>: ${s.pace_display}<br>` +
+          `<strong>Mile ${s.mile}</strong>: ${s.pace_display}${climb}<br>` +
           `<span class="mile-tooltip-note">at ${s.at_display} moving${note ? ` &middot; ${note}` : ''}</span>`;
         const label = `Mile ${s.mile}: ${s.pace_display}${note ? `, ${note.toLowerCase()}` : ''}`;
         const signature = [s.lat, s.lon, kind, tooltip].join('|');
@@ -802,6 +812,183 @@
 
     window.addEventListener('resize', renderPaceChart);
 
+    // --- Elevation profile: one area series, distance across and height up.
+    // Hover/tap/arrow keys show a tooltip and put a dot on the map where that
+    // point was; the splits list below is the table view (each mile's climb).
+    const ELEV_COLOR = '#13805a';  // passes the palette checks against the card surface
+    const ELEV_HEIGHT = 160;
+    let lastProfile = [];  // [[miles, feet, path index], ...]
+    let elevActive = null;
+    let elevMapDot = null;
+
+    function showElevDot(pathIndex) {
+      if (!mapReady) return;
+      const point = lastPathLatLngs[pathIndex];
+      if (!point) {
+        hideElevDot();
+        return;
+      }
+      if (elevMapDot) {
+        elevMapDot.setLatLng(point);
+      } else {
+        elevMapDot = L.circleMarker(point, {
+          radius: 7, color: '#ffffff', weight: 3, fillColor: ELEV_COLOR, fillOpacity: 1, interactive: false,
+        }).addTo(map);
+      }
+    }
+
+    function hideElevDot() {
+      if (elevMapDot) {
+        map.removeLayer(elevMapDot);
+        elevMapDot = null;
+      }
+    }
+
+    function niceStep(range, maxTicks) {
+      const raw = range / maxTicks;
+      const magnitude = Math.pow(10, Math.floor(Math.log10(raw)));
+      for (const m of [1, 2, 2.5, 5, 10]) if (m * magnitude >= raw) return m * magnitude;
+      return 10 * magnitude;
+    }
+
+    function renderElevationChart() {
+      const card = document.getElementById('elev-chart-card');
+      const profile = lastProfile;
+      if (!profile || profile.length < 2) {
+        card.hidden = true;
+        elevActive = null;
+        hideElevDot();
+        return;
+      }
+      card.hidden = false;
+
+      const container = document.getElementById('elev-chart');
+      const width = container.clientWidth;
+      const m = { top: 20, right: 14, bottom: 26, left: 52 };
+      const plotW = width - m.left - m.right;
+      const plotH = ELEV_HEIGHT - m.top - m.bottom;
+      const maxMiles = Math.max(profile[profile.length - 1][0], 0.01);
+      const feet = profile.map(p => p[1]);
+      const minFt = Math.min(...feet), maxFt = Math.max(...feet);
+      const step = niceStep(Math.max(maxFt - minFt, 20), 3);  // at least 20 ft tall, so flat runs look flat
+      const lo = Math.floor(minFt / step) * step;
+      const hi = Math.max(Math.ceil(maxFt / step) * step, lo + step);
+      const x = miles => m.left + (miles / maxMiles) * plotW;
+      const y = ft => m.top + (1 - (ft - lo) / (hi - lo)) * plotH;
+
+      const svg = svgEl('svg', {
+        width, height: ELEV_HEIGHT, tabindex: 0, role: 'img',
+        'aria-label': `Elevation: ${minFt} to ${maxFt} ft over ${maxMiles.toFixed(2)} miles. Each mile's climb and descent is in the splits list.`,
+      });
+
+      for (let t = lo; t <= hi; t += step) {
+        svg.appendChild(svgEl('line', { x1: m.left, x2: width - m.right, y1: y(t), y2: y(t), stroke: '#c8cacd', 'stroke-width': 1 }));
+        const label = svgEl('text', { x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end', class: 'tick' });
+        label.textContent = `${t} ft`;
+        svg.appendChild(label);
+      }
+      const wholeMiles = Math.floor(maxMiles);
+      const mileEvery = Math.max(1, Math.ceil(wholeMiles / Math.max(1, Math.floor(plotW / 32))));
+      for (let mi = 0; mi <= wholeMiles; mi += mileEvery) {
+        const label = svgEl('text', { x: x(mi), y: ELEV_HEIGHT - 6, 'text-anchor': 'middle', class: 'tick' });
+        label.textContent = mi;
+        svg.appendChild(label);
+      }
+
+      const points = profile.map(p => `${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`);
+      const base = m.top + plotH;
+      svg.appendChild(svgEl('path', {
+        d: `M${x(profile[0][0]).toFixed(1)},${base} L${points.join(' L')} L${x(maxMiles).toFixed(1)},${base} Z`,
+        fill: ELEV_COLOR, 'fill-opacity': 0.1, stroke: 'none',
+      }));
+      const crosshair = svgEl('line', { y1: m.top, y2: base, stroke: '#adb5bd', 'stroke-width': 1, visibility: 'hidden' });
+      svg.appendChild(crosshair);
+      svg.appendChild(svgEl('polyline', {
+        points: points.join(' '), fill: 'none', stroke: ELEV_COLOR, 'stroke-width': 2,
+        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      }));
+
+      // Label only the extreme: the highest point.
+      const top = feet.indexOf(maxFt);
+      const topLabel = svgEl('text', {
+        x: Math.min(Math.max(x(profile[top][0]), m.left + 20), width - m.right - 20), y: y(maxFt) - 8,
+        'text-anchor': 'middle', class: 'extreme-label',
+      });
+      topLabel.textContent = `${maxFt} ft`;
+      svg.appendChild(topLabel);
+
+      const dot = svgEl('circle', { r: 5, fill: ELEV_COLOR, stroke: '#e2e3e5', 'stroke-width': 2, visibility: 'hidden' });
+      svg.appendChild(dot);
+      const tooltip = document.createElement('div');
+      tooltip.className = 'pace-tooltip';
+      tooltip.hidden = true;
+
+      function show(i) {
+        elevActive = i;
+        const [miles, ft, pathIndex] = profile[i];
+        crosshair.setAttribute('x1', x(miles));
+        crosshair.setAttribute('x2', x(miles));
+        crosshair.setAttribute('visibility', 'visible');
+        dot.setAttribute('cx', x(miles));
+        dot.setAttribute('cy', y(ft));
+        dot.setAttribute('visibility', 'visible');
+        tooltip.textContent = `${miles.toFixed(2)} mi · ${ft} ft`;
+        tooltip.hidden = false;
+        const tipW = tooltip.offsetWidth;
+        tooltip.style.left = `${Math.max(0, Math.min(width - tipW, x(miles) - tipW / 2))}px`;
+        tooltip.style.top = `${y(ft)}px`;
+        showElevDot(pathIndex);  // and where that was on the map
+      }
+
+      function hide() {
+        elevActive = null;
+        crosshair.setAttribute('visibility', 'hidden');
+        dot.setAttribute('visibility', 'hidden');
+        tooltip.hidden = true;
+        hideElevDot();
+      }
+
+      function nearestIndex(clientX) {
+        const miles = ((clientX - svg.getBoundingClientRect().left - m.left) / plotW) * maxMiles;
+        let best = 0;
+        for (let i = 1; i < profile.length; i++) {
+          if (Math.abs(profile[i][0] - miles) < Math.abs(profile[best][0] - miles)) best = i;
+        }
+        return best;
+      }
+
+      svg.addEventListener('pointermove', e => show(nearestIndex(e.clientX)));
+      svg.addEventListener('pointerdown', e => show(nearestIndex(e.clientX)));
+      svg.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') hide(); });
+      svg.addEventListener('blur', hide);
+      svg.addEventListener('keydown', e => {
+        if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+          e.preventDefault();
+          const jump = Math.max(1, Math.round(profile.length / 50)) * (e.key === 'ArrowRight' ? 1 : -1);
+          show(Math.max(0, Math.min(profile.length - 1, (elevActive ?? (jump > 0 ? -jump : profile.length)) + jump)));
+        } else if (e.key === 'Escape') {
+          hide();
+        }
+      });
+
+      // Re-rendered on every 3s poll - keep whatever the viewer was inspecting.
+      const keepIndex = elevActive;
+      const hadFocus = container.contains(document.activeElement);
+      container.replaceChildren(svg, tooltip);
+      if (hadFocus) svg.focus({ preventScroll: true });
+      if (keepIndex !== null && keepIndex < profile.length) show(keepIndex);
+      else hideElevDot();
+    }
+
+    window.addEventListener('resize', renderElevationChart);
+
+    // "↑79 ↓45 ft" for a split, or '' until its elevation is known
+    // (about 40 m after the mile mark, once smoothing has passed it).
+    function elevationText(split, prefix) {
+      if (split.elevation_gain_ft == null) return '';
+      return `${prefix}<span class="text-muted small">↑${split.elevation_gain_ft} ↓${split.elevation_loss_ft} ft</span>`;
+    }
+
     function showRunError(message) {
       const box = document.getElementById('run-error');
       box.textContent = message;
@@ -868,16 +1055,21 @@
         lastSplits = data.splits || [];
         lastTarget = data.target_pace_seconds || null;
         renderPaceChart();
+        lastProfile = data.elevation_profile || [];
+        renderElevationChart();
+        document.getElementById('stat-elevation').textContent =
+          data.elevation_gain_ft != null ? `↑ ${data.elevation_gain_ft} ft` : '';
 
         const list = document.getElementById('splits-list');
         const rows = (data.splits || [])
           .slice()
           .reverse()
-          .map(s => `<li class="list-group-item">Mile ${s.mile}: ${s.pace_display}</li>`);
+          .map(s => `<li class="list-group-item">Mile ${s.mile}: ${s.pace_display}${elevationText(s, ' · ')}</li>`);
         if (data.partial_split) {
           const p = data.partial_split;
           const label = data.active ? `${p.distance_miles.toFixed(2)} mi so far` : `${p.distance_miles.toFixed(2)} mi`;
-          rows.unshift(`<li class="list-group-item ${data.active ? 'text-muted fst-italic' : ''}">${label}: ${p.pace_display}</li>`);
+          const elevation = data.active ? '' : elevationText(p, ' · ');
+          rows.unshift(`<li class="list-group-item ${data.active ? 'text-muted fst-italic' : ''}">${label}: ${p.pace_display}${elevation}</li>`);
         }
         list.innerHTML = rows.length
           ? rows.join('')

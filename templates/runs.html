@@ -202,7 +202,10 @@
         title.appendChild(el('span', { class: 'badge text-bg-secondary', text: STATUS_LABELS[run.status] || run.status }));
       }
 
-      const stats = [miles(run.distance_miles), run.moving_display, run.average_pace_display].filter(Boolean).join(' · ');
+      const stats = [
+        miles(run.distance_miles), run.moving_display, run.average_pace_display,
+        run.elevation_gain_ft != null ? `↑ ${run.elevation_gain_ft} ft` : null,
+      ].filter(Boolean).join(' · ');
       const extra = [
         run.fastest_mile ? `Fastest mile ${run.fastest_mile.pace_display.replace('/mi', '')} (mile ${run.fastest_mile.mile})` : null,
         run.weather_display,

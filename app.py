@@ -208,6 +208,8 @@ def run_summary_message(summary, goal_reached_miles):
         _, record_mile = record_status(summary["splits"], summary.get("run_id"), not summary.get("test_mode_used"))
         record_note = " - fastest mile ever!" if record_mile == fastest["mile"] else ""
         lines.append(f"Fastest mile: Mile {fastest['mile']} - {fastest['pace_display']}{record_note}")
+    if summary.get("elevation_gain_ft") is not None:
+        lines.append(f"Elevation gain: {summary['elevation_gain_ft']} ft")
     if goal_reached_miles:
         lines.append(f"Goal reached: {goal_reached_miles:.2f} mi")
     site = public_site_url()
@@ -436,11 +438,14 @@ def ensure_run_recorded():
 
 
 def tracker_input(props, lat, lon):
-    """(lat, lon, timestamp, accuracy, speed) for RunTracker.process_point, or None if unusable."""
+    """(lat, lon, timestamp, accuracy, speed, altitude) for RunTracker.process_point, or None if unusable."""
     timestamp_raw = props.get("timestamp")
     if not timestamp_raw or lat is None or lon is None:
         return None
-    return lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy"), props.get("speed")
+    return (
+        lat, lon, parse_timestamp(timestamp_raw), props.get("horizontal_accuracy"), props.get("speed"),
+        props.get("altitude"),
+    )
 
 
 def replay_points(run_tracker, saved):
@@ -501,9 +506,36 @@ def run_in_background(target):
     threading.Thread(target=target, daemon=True).start()
 
 
+def backfill_elevation():
+    """Work out elevation (and any missing mile-marker locations) for finished
+    runs saved before it was calculated, by rebuilding them from their raw
+    points. Deployed copy only - a local copy shares the database and may be
+    running experimental code."""
+    if SETTINGS_SCOPE == "local":
+        return
+    try:
+        if not db.has_elevation_columns():
+            logger.warning("Elevation: the database has no elevation columns yet - run the ALTER TABLE"
+                           " for elevation_gain_ft/elevation_loss_ft, then restart to fill in past runs")
+            return
+        missing = db.runs_missing_elevation()
+    except Exception:
+        logger.exception("Elevation: couldn't check for past runs to fill in")
+        return
+    for run_id in missing:
+        try:
+            row = db.get_run(run_id)
+            summary = rebuilt_run(run_id, row)
+            db.save_rebuilt_details(run_id, summary)
+            logger.info("Elevation: filled in run %s (%s ft gain)", run_id, summary["elevation_gain_ft"])
+        except Exception:
+            logger.exception("Elevation: couldn't fill in run %s", run_id)
+
+
 def startup_from_database():
     restore_last_run()
     refresh_best_mile()
+    backfill_elevation()
 
 
 def recover_run(trip):
@@ -760,6 +792,7 @@ def run_list_item(row):
             "mile": row["fastest_mile"], "pace_display": format_pace(float(row["fastest_pace_seconds"])),
         } if row["fastest_pace_seconds"] is not None else None,
         "weather_display": run_weather_display(row),
+        "elevation_gain_ft": row["elevation_gain_ft"],
         "holds_record": bool(record and record["run_id"] == row["id"]),
     }
 
@@ -1095,9 +1128,9 @@ def receive_overland_batch():
     # restart can't replay short of it and send that DM a second time.
     dm_checkpoint_hit = False
 
-    for lat, lon, timestamp, accuracy, speed in points:
+    for lat, lon, timestamp, accuracy, speed, altitude in points:
         meters_before = tracker.cumulative_meters if tracker.active else 0.0
-        event = tracker.process_point(lat, lon, timestamp, accuracy, speed)
+        event = tracker.process_point(lat, lon, timestamp, accuracy, speed, altitude)
         if admin_state["discord_test_mode"]:
             tracker.test_mode_used = True  # on at any point = not a real run, for records
         ping_window["outcomes"][tracker.last_outcome] += 1

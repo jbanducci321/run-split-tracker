@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 import pymysql
 
@@ -105,12 +106,75 @@ def save_point_chunk(run_id, chunk_index, points):
 
 MYSQL_UNKNOWN_COLUMN = 1054
 
+# Columns added after the first version of the schema. Code that writes or
+# reads them checks they exist first, so deploying before the matching
+# ALTER TABLE is run degrades gracefully (the data is just left out) instead
+# of failing - e.g. a finished run is never lost over a missing column.
+_column_cache = {}  # table -> (column names, when checked)
+COLUMN_RECHECK_SECONDS = 300  # notice an ALTER TABLE within a few minutes
 
-def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
-    splits = [(run_id, s["mile"], 1.0, s["pace_seconds"], 0, s.get("lat"), s.get("lon")) for s in summary["splits"]]
+
+def columns(table):
+    cached = _column_cache.get(table)
+    if cached and time.monotonic() - cached[1] < COLUMN_RECHECK_SECONDS:
+        return cached[0]
+
+    def work(cur):
+        cur.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+            (table,),
+        )
+        return {row[0] for row in cur.fetchall()}
+    names = _transaction(work)
+    _column_cache[table] = (names, time.monotonic())
+    return names
+
+
+def has_elevation_columns():
+    return "elevation_gain_ft" in columns("rst_runs") and "elevation_gain_ft" in columns("rst_splits")
+
+
+def _split_rows(run_id, summary):
+    """rst_splits values for a run summary: every full mile, then the trailing partial."""
+    rows = [
+        {
+            "mile_number": s["mile"], "distance_miles": 1.0, "pace_seconds": s["pace_seconds"], "is_partial": 0,
+            "lat": s.get("lat"), "lon": s.get("lon"),
+            "elevation_gain_ft": s.get("elevation_gain_ft"), "elevation_loss_ft": s.get("elevation_loss_ft"),
+        }
+        for s in summary["splits"]
+    ]
     partial = summary.get("partial_split")
     if partial:
-        splits.append((run_id, len(summary["splits"]) + 1, partial["distance_miles"], partial["pace_seconds"], 1, None, None))
+        rows.append({
+            "mile_number": len(summary["splits"]) + 1, "distance_miles": partial["distance_miles"],
+            "pace_seconds": partial["pace_seconds"], "is_partial": 1, "lat": None, "lon": None,
+            "elevation_gain_ft": partial.get("elevation_gain_ft"), "elevation_loss_ft": partial.get("elevation_loss_ft"),
+        })
+    return [dict(row, run_id=run_id) for row in rows]
+
+
+def _upsert_splits(cur, run_id, summary, available):
+    """available: rst_splits' columns, looked up BEFORE the transaction (the
+    connection lock isn't re-entrant, so columns() can't run inside one)."""
+    rows = _split_rows(run_id, summary)
+    if not rows:
+        return
+    names = [name for name in rows[0] if name in available]
+    if len(names) < len(rows[0]):
+        logger.warning("DB: rst_splits is missing %s - saving run %s splits without them",
+                       sorted(set(rows[0]) - set(names)), run_id)
+    updates = [name for name in names if name not in ("run_id", "mile_number")]
+    cur.executemany(
+        f"INSERT INTO rst_splits ({', '.join(names)}) VALUES ({', '.join(['%s'] * len(names))})"
+        f" ON DUPLICATE KEY UPDATE {', '.join(f'{n} = VALUES({n})' for n in updates)}",
+        [tuple(row[n] for n in names) for row in rows],
+    )
+
+
+def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
+    elevation = has_elevation_columns()
+    split_columns = columns("rst_splits")
 
     def work(cur):
         cur.execute(
@@ -129,28 +193,36 @@ def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
                 run_id,
             ),
         )
-        if not splits:
-            return
-        try:
-            cur.executemany(
-                "INSERT INTO rst_splits (run_id, mile_number, distance_miles, pace_seconds, is_partial, lat, lon)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
-                " ON DUPLICATE KEY UPDATE pace_seconds = VALUES(pace_seconds),"
-                " distance_miles = VALUES(distance_miles), lat = VALUES(lat), lon = VALUES(lon)",
-                splits,
+        if elevation:
+            cur.execute(
+                "UPDATE rst_runs SET elevation_gain_ft = %s, elevation_loss_ft = %s WHERE id = %s",
+                (summary.get("elevation_gain_ft"), summary.get("elevation_loss_ft"), run_id),
             )
-        except pymysql.err.OperationalError as exc:
-            if exc.args[0] != MYSQL_UNKNOWN_COLUMN:
-                raise
-            # rst_splits doesn't have the lat/lon columns yet - save the splits
-            # without their locations rather than lose the run's summary.
-            logger.warning("DB: rst_splits has no lat/lon columns yet - saving run %s splits without locations", run_id)
-            cur.executemany(
-                "INSERT INTO rst_splits (run_id, mile_number, distance_miles, pace_seconds, is_partial)"
-                " VALUES (%s, %s, %s, %s, %s)"
-                " ON DUPLICATE KEY UPDATE pace_seconds = VALUES(pace_seconds),"
-                " distance_miles = VALUES(distance_miles)",
-                [row[:5] for row in splits],
+        _upsert_splits(cur, run_id, summary, split_columns)
+    _transaction(work)
+
+
+def runs_missing_elevation():
+    """Finished runs saved before elevation was calculated."""
+    def work(cur):
+        cur.execute("SELECT id FROM rst_runs WHERE status = 'completed' AND elevation_gain_ft IS NULL ORDER BY id")
+        return [row[0] for row in cur.fetchall()]
+    return _transaction(work)
+
+
+def save_rebuilt_details(run_id, summary):
+    """Fill in a saved run's elevation (and mile-marker locations) from a
+    rebuild of its raw points - the other numbers are already saved."""
+    def work(cur):
+        cur.execute(
+            "UPDATE rst_runs SET elevation_gain_ft = %s, elevation_loss_ft = %s WHERE id = %s",
+            (summary.get("elevation_gain_ft"), summary.get("elevation_loss_ft"), run_id),
+        )
+        for row in _split_rows(run_id, summary):
+            cur.execute(
+                "UPDATE rst_splits SET lat = COALESCE(lat, %s), lon = COALESCE(lon, %s),"
+                " elevation_gain_ft = %s, elevation_loss_ft = %s WHERE run_id = %s AND mile_number = %s",
+                (row["lat"], row["lon"], row["elevation_gain_ft"], row["elevation_loss_ft"], run_id, row["mile_number"]),
             )
     _transaction(work)
 
@@ -159,11 +231,13 @@ RUN_LIST_COLUMNS = (
     "id", "status", "test_mode", "started_at", "timezone", "distance_miles", "moving_seconds",
     "avg_pace_seconds", "goal_distance_miles", "target_pace_seconds",
     "temperature_f", "weather_code", "wind_mph", "wind_direction_deg",
-    "fastest_pace_seconds", "fastest_mile",
+    "fastest_pace_seconds", "fastest_mile", "elevation_gain_ft",
 )
 
 
 def _run_rows(where, params):
+    elevation = "r.elevation_gain_ft" if "elevation_gain_ft" in columns("rst_runs") else "NULL"
+
     def work(cur):
         cur.execute(
             "SELECT r.id, r.status, r.test_mode, r.started_at, r.timezone, r.distance_miles, r.moving_seconds,"
@@ -172,7 +246,8 @@ def _run_rows(where, params):
             " (SELECT s.pace_seconds FROM rst_splits s WHERE s.run_id = r.id AND s.is_partial = 0"
             "  ORDER BY s.pace_seconds, s.mile_number LIMIT 1),"
             " (SELECT s.mile_number FROM rst_splits s WHERE s.run_id = r.id AND s.is_partial = 0"
-            "  ORDER BY s.pace_seconds, s.mile_number LIMIT 1)"
+            "  ORDER BY s.pace_seconds, s.mile_number LIMIT 1),"
+            f" {elevation}"
             " FROM rst_runs r LEFT JOIN rst_run_conditions c ON c.run_id = r.id"
             f" WHERE {where} ORDER BY r.started_at DESC LIMIT 500",
             params,

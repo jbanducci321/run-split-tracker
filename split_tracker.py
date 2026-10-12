@@ -46,6 +46,55 @@ PAUSE_AFTER_SECONDS = 10
 STATIONARY_SPEED_MPS = 0.5
 
 
+# Elevation gain. The phone reports altitude in whole meters (+/-3 m, GPS
+# blended with the barometer), so summing every point-to-point rise counts
+# the 1 m flicker as climbing - thousands of fake feet per run. Instead,
+# altitude is averaged over ELEVATION_SMOOTHING_METERS of route, and a climb
+# or descent only counts once it moves ELEVATION_THRESHOLD_METERS past the
+# last turning point. Tuned against Strava on three runs (382/254/373 ft vs
+# 380/266/353 ft here; per-mile net changes within 2 ft).
+ELEVATION_SMOOTHING_METERS = 80
+ELEVATION_THRESHOLD_METERS = 4
+FEET_PER_METER = 3.28084
+
+
+class ClimbCounter:
+    """Total gain/loss of a (smoothed) altitude series, ignoring wiggles smaller than the threshold."""
+
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.ref = None  # the last turning point (or the newest high/low while moving that way)
+        self.direction = 0  # 1 climbing, -1 descending, 0 not yet known
+        self.gain = 0.0
+        self.loss = 0.0
+
+    def add(self, altitude):
+        if self.ref is None:
+            self.ref = altitude
+            return
+        rise = altitude - self.ref
+        if self.direction == 1:
+            if rise > 0:
+                self.gain += rise  # a new high on the way up
+                self.ref = altitude
+            elif -rise >= self.threshold:
+                self.loss += -rise  # turned downhill
+                self.direction, self.ref = -1, altitude
+        elif self.direction == -1:
+            if rise < 0:
+                self.loss += -rise  # a new low on the way down
+                self.ref = altitude
+            elif rise >= self.threshold:
+                self.gain += rise  # turned uphill
+                self.direction, self.ref = 1, altitude
+        elif abs(rise) >= self.threshold:
+            if rise > 0:
+                self.gain += rise
+            else:
+                self.loss += -rise
+            self.direction, self.ref = (1 if rise > 0 else -1), altitude
+
+
 def haversine_meters(lat1, lon1, lat2, lon2):
     r = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -112,6 +161,75 @@ class RunTracker:
         # (cumulative meters, moving seconds) after each counted point - for recent_pace().
         # ~30 min of points at a 5s interval, far more than any window used.
         self.progress = deque(maxlen=400)
+
+        # Elevation (see ELEVATION_SMOOTHING_METERS). Each accepted point's
+        # altitude is smoothed once the route has gone half a window past it.
+        self.elev_track_meters = 0.0  # point-to-point distance along accepted points (the smoothing axis)
+        self.elev_samples = []  # (track meters, run meters, altitude m, path index)
+        self.elev_window = [0, 0, 0.0]  # lo index, hi index, altitude sum of samples[lo:hi]
+        self.elev_profile = []  # smoothed: (run meters, altitude m, gain so far m, loss so far m, path index)
+        self.climb = ClimbCounter(ELEVATION_THRESHOLD_METERS)
+
+    def _add_altitude(self, altitude, step_meters):
+        self.elev_track_meters += step_meters
+        if altitude is None:
+            return
+        self.elev_samples.append((self.elev_track_meters, self.cumulative_meters, float(altitude), len(self.path) - 1))
+        self._smooth_altitudes(final=False)
+
+    def _smooth_altitudes(self, final):
+        """Smooth every sample whose full window is now known (or, at the end
+        of the run, every remaining one) and feed it to the climb counter."""
+        samples, half = self.elev_samples, ELEVATION_SMOOTHING_METERS / 2
+        lo, hi, total = self.elev_window
+        while len(self.elev_profile) < len(samples):
+            track, run_meters, _, path_index = samples[len(self.elev_profile)]
+            if not final and samples[-1][0] < track + half:
+                break  # the window ahead of this sample isn't complete yet
+            while hi < len(samples) and samples[hi][0] <= track + half:
+                total += samples[hi][2]
+                hi += 1
+            while samples[lo][0] < track - half:
+                total -= samples[lo][2]
+                lo += 1
+            altitude = total / (hi - lo)
+            self.climb.add(altitude)
+            self.elev_profile.append((run_meters, altitude, self.climb.gain, self.climb.loss, path_index))
+        self.elev_window = [lo, hi, total]
+
+    def _elevation_at(self, run_meters):
+        """(gain so far m, loss so far m, altitude m) at the last smoothed point at or before run_meters."""
+        lo, hi = 0, len(self.elev_profile)  # binary search - run meters only grow along the profile
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.elev_profile[mid][0] <= run_meters:
+                lo = mid + 1
+            else:
+                hi = mid
+        index = lo - 1
+        if index < 0:
+            return 0.0, 0.0, None
+        _, altitude, gain, loss, _ = self.elev_profile[index]
+        return gain, loss, altitude
+
+    def _elevation_between(self, start_meters, end_meters):
+        """{gain, loss in feet} between two points of the run (None values if not smoothed that far yet)."""
+        if not self.elev_profile or self.elev_profile[-1][0] < end_meters:
+            return {"elevation_gain_ft": None, "elevation_loss_ft": None}
+        gain_start, loss_start, _ = self._elevation_at(start_meters)
+        gain_end, loss_end, _ = self._elevation_at(end_meters)
+        return {
+            "elevation_gain_ft": round((gain_end - gain_start) * FEET_PER_METER),
+            "elevation_loss_ft": round((loss_end - loss_start) * FEET_PER_METER),
+        }
+
+    def _elevation_profile_for_chart(self, max_points=300):
+        """[[miles, feet, path index], ...], thinned evenly to at most max_points."""
+        profile = self.elev_profile
+        if len(profile) > max_points:
+            step = (len(profile) - 1) / (max_points - 1)
+            profile = [profile[round(i * step)] for i in range(max_points)]
+        return [[round(p[0] / MILE_METERS, 3), round(p[1] * FEET_PER_METER), p[4]] for p in profile]
 
     def recent_pace(self, window_meters):
         """Moving-time pace (seconds per mile) over roughly the last
@@ -204,6 +322,8 @@ class RunTracker:
                     # path[previous path_end:path_end], then this marker.
                     "path_end": s["path_end"],
                     "at_display": format_duration(s["crossing_moving"]),  # moving time when the mile was finished
+                    # Filled in once smoothing has passed the mile mark (~40 m after it).
+                    **self._elevation_between((s["mile"] - 1) * MILE_METERS, s["mile"] * MILE_METERS),
                 }
                 for s in self.splits
             ],
@@ -212,11 +332,17 @@ class RunTracker:
                 "distance_miles": round(partial_distance_miles, 2),
                 "pace_seconds": round(partial_pace_seconds, 1),
                 "pace_display": format_pace(partial_pace_seconds),
+                **self._elevation_between((self.next_split_mile - 1) * MILE_METERS, self.cumulative_meters),
             } if partial_pace_seconds else None,
             "path": [[lat, lon] for lat, lon in self.path],
+            # Total climbing/descending so far (None until there's altitude data).
+            "elevation_gain_ft": round(self.climb.gain * FEET_PER_METER) if self.elev_profile else None,
+            "elevation_loss_ft": round(self.climb.loss * FEET_PER_METER) if self.elev_profile else None,
+            "elevation_profile": self._elevation_profile_for_chart(),
         }
 
     def end(self):
+        self._smooth_altitudes(final=True)  # the last ~40 m had no window ahead of them yet
         summary = self.current_stats()
         summary["active"] = False
         summary["paused"] = False
@@ -227,7 +353,7 @@ class RunTracker:
         self.reset()
         return summary
 
-    def process_point(self, lat, lon, timestamp, accuracy, speed=None):
+    def process_point(self, lat, lon, timestamp, accuracy, speed=None, altitude=None):
         """Feed one GPS point in. Returns a checkpoint event or None, and sets
         last_outcome to what happened to the point (for the ping summary log)."""
         if not self.active:
@@ -244,6 +370,7 @@ class RunTracker:
 
         elapsed = None
         prev_time = None
+        raw_distance = 0.0
         if self.last_raw_point is not None:
             prev_lat, prev_lon, prev_time = self.last_raw_point
             elapsed = (timestamp - prev_time).total_seconds()
@@ -263,6 +390,7 @@ class RunTracker:
         smoothed_lon = sum(p[1] for p in self.raw_buffer) / len(self.raw_buffer)
         self.last_smoothed_point = (smoothed_lat, smoothed_lon)
         self.path.append((smoothed_lat, smoothed_lon))
+        self._add_altitude(altitude, raw_distance)  # every accepted point, moving or not
 
         if self.distance_anchor is None:
             self.distance_anchor = (lat, lon, timestamp)
