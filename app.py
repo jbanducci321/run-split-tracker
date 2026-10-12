@@ -15,7 +15,7 @@ import map_image
 import weather
 from discord_notifier import send_dm
 from split_tracker import (
-    ALGORITHM_VERSION, MILE_METERS, RunTracker, format_duration, format_pace, parse_timestamp,
+    ALGORITHM_VERSION, BEST_EFFORT_DISTANCES, MILE_METERS, RunTracker, format_duration, format_pace, parse_timestamp,
 )
 
 load_dotenv()
@@ -77,6 +77,7 @@ admin_state = {
     "dm_target_comparison": True,  # the "(8s faster than target)" part of pace DMs
     "dm_new_record": True,
     "dm_run_summary": True,
+    "dm_best_efforts": True,  # after the run, only when it earned a gold/silver/bronze
     "dm_pace_check": False,  # off by default - it's the one most likely to nag
 }
 BOOLEAN_SETTINGS = {name for name, value in admin_state.items() if isinstance(value, bool)}
@@ -489,7 +490,14 @@ MIN_RECORD_PACE_SECONDS = 4 * 60  # a "mile" faster than 4:00 is bad data, not a
 best_mile = {"record": None, "loaded": False, "last_attempt": float("-inf")}
 
 
+# Gold/silver/bronze best efforts: the top 3 real runs at each distance,
+# loaded with the fastest mile and refreshed at the same times.
+best_effort_leaders = {"leaders": {}, "loaded": False}
+MEDALS = {1: "gold", 2: "silver", 3: "bronze"}
+
+
 def refresh_best_mile():
+    """Reload the fastest mile ever and the best-effort leaders."""
     best_mile["last_attempt"] = time.monotonic()
     try:
         best_mile["record"] = db.load_best_mile(MIN_RECORD_PACE_SECONDS)
@@ -502,6 +510,49 @@ def refresh_best_mile():
         "Records: fastest mile ever %s",
         f"{format_pace(record['pace_seconds'])} (run {record['run_id']}, mile {record['mile']})" if record else "- none yet",
     )
+    try:
+        if db.has_best_efforts_table():
+            best_effort_leaders.update(leaders=db.load_best_effort_leaders(), loaded=True)
+            logger.info("Records: best efforts loaded for %d distances", len(best_effort_leaders["leaders"]))
+        else:
+            logger.warning("Records: no rst_best_efforts table yet - run its CREATE TABLE to turn on best efforts")
+    except Exception:
+        logger.exception("Records: couldn't load best efforts")
+
+
+def ranked_efforts(efforts, run_id, counts_for_records):
+    """A run's best efforts, each with 'rank': 1-3 if it's gold/silver/bronze
+    among real runs (each run counts once per distance), else None."""
+    leaders = best_effort_leaders["leaders"] if best_effort_leaders["loaded"] else None
+    ranked = []
+    for effort in efforts:
+        rank = None
+        if counts_for_records and leaders is not None:
+            entries = leaders.get(effort["key"], [])
+            saved_position = next((i for i, e in enumerate(entries) if e["run_id"] == run_id), None)
+            if saved_position is not None:
+                rank = saved_position + 1  # already saved - the database ordering (ties to the earlier run) decides
+            else:
+                # A run in progress (or just finished): ties go to the runs that got there first.
+                rank = 1 + sum(1 for e in entries if e["seconds"] <= effort["seconds"])
+            if rank > 3:
+                rank = None
+        ranked.append(dict(effort, rank=rank))
+    return ranked
+
+
+def best_efforts_message(summary):
+    """The after-run DM listing this run's medals, or None if it earned none."""
+    if summary.get("test_mode_used"):
+        return None
+    medals = [e for e in ranked_efforts(summary.get("best_efforts") or [], summary.get("run_id"), True) if e["rank"]]
+    if not medals:
+        return None
+    parts = [
+        f"{e['name']} {e['time_display']} ({MEDALS[e['rank']]}{' - new PR!' if e['rank'] == 1 else ''})"
+        for e in medals
+    ]
+    return "Best efforts: " + ", ".join(parts)
 
 
 def run_in_background(target):
@@ -534,10 +585,37 @@ def backfill_elevation():
             logger.exception("Elevation: couldn't fill in run %s", run_id)
 
 
+def backfill_best_efforts():
+    """Work out best efforts for finished runs saved before they existed
+    (deployed copy only, like backfill_elevation)."""
+    if SETTINGS_SCOPE == "local":
+        return
+    try:
+        if not db.has_best_efforts_table():
+            return  # refresh_best_mile already logged how to turn it on
+        missing = db.runs_missing_best_efforts()
+    except Exception:
+        logger.exception("Best efforts: couldn't check for past runs to fill in")
+        return
+    filled = 0
+    for run_id in missing:
+        try:
+            summary = rebuilt_run(run_id, db.get_run(run_id))
+            if summary["best_efforts"]:
+                db.save_best_efforts(run_id, summary["best_efforts"])
+                filled += 1
+                logger.info("Best efforts: filled in run %s (%d distances)", run_id, len(summary["best_efforts"]))
+        except Exception:
+            logger.exception("Best efforts: couldn't fill in run %s", run_id)
+    if filled:
+        refresh_best_mile()  # the leaders now include those runs
+
+
 def startup_from_database():
     restore_last_run()
     refresh_best_mile()
     backfill_elevation()
+    backfill_best_efforts()
 
 
 def recover_run(trip):
@@ -720,6 +798,7 @@ def build_status_payload(stats, run_id=None, counts_for_records=False, goal=CURR
     stats.pop("run_id", None)
     stats.pop("test_mode_used", None)
     stats["record"], stats["record_mile"] = record_status(stats["splits"], run_id, counts_for_records)
+    stats["best_efforts"] = ranked_efforts(stats.get("best_efforts") or [], run_id, counts_for_records)
     stats["target_pace_seconds"] = target
     stats["goal_distance_miles"] = goal
     stats["goal_progress_percent"] = None
@@ -871,6 +950,33 @@ def api_runs():
         admin=admin,
         recording_run_id=recording["run_id"] if admin else None,
     )
+
+
+@app.get("/api/best-efforts")
+def api_best_efforts():
+    """Gold/silver/bronze at every distance, for the Past Runs page."""
+    if not PERSISTENCE_ENABLED:
+        return jsonify(error="Best efforts need the database, which isn't set up."), 503
+    if not best_effort_leaders["loaded"]:
+        refresh_best_mile()  # not loaded yet (startup still running, or the table is new) - try now
+        if not best_effort_leaders["loaded"]:
+            return jsonify(error="Best efforts aren't available yet - try again shortly."), 503
+    distances = []
+    for key, name, meters in BEST_EFFORT_DISTANCES:
+        entries = best_effort_leaders["leaders"].get(key)
+        if entries:
+            distances.append({"key": key, "name": name, "entries": [
+                {
+                    "rank": i + 1,
+                    "time_display": format_duration(e["seconds"]),
+                    "pace_display": format_pace(e["seconds"] / (meters / MILE_METERS)),
+                    "run_id": e["run_id"],
+                    "started_at": iso_utc(e["started_at"]),
+                    "timezone": e["timezone"],
+                }
+                for i, e in enumerate(entries)
+            ]})
+    return jsonify(distances=distances)
 
 
 @app.get("/api/runs/<int:run_id>")
@@ -1103,11 +1209,18 @@ def receive_overland_batch():
             # Built before finish_recording refreshes the record, so "fastest
             # mile ever" compares against the record as it stood before this run.
             summary_message = run_summary_message(last_summary, goal if goal_reached else None)
+            efforts_message = best_efforts_message(last_summary)  # same: medals vs the leaders before this run
             if PERSISTENCE_ENABLED and not test_mode_used:
                 finish_recording(last_summary, ended_at, goal_reached)
-            if summary_message:
+            if summary_message or efforts_message:
                 finished_path = list(last_summary["path"])
-                run_in_background(lambda: send_run_summary(summary_message, finished_path))
+
+                def send_after_run():  # one thread, so the best efforts DM lands after the summary
+                    if summary_message:
+                        send_run_summary(summary_message, finished_path)
+                    if efforts_message:
+                        notify(efforts_message, "dm_best_efforts")
+                run_in_background(send_after_run)
         return jsonify(result="ok")
 
     if not tracker.active and recording["run_id"] is None:

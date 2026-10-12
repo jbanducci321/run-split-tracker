@@ -51,7 +51,19 @@
     }
     .legend-dot.fastest { background: #ffc107; box-shadow: 0 0 0 1px #212529; }
     .legend-star { vertical-align: -2px; }
-    #map-legend[hidden] { display: none !important; }  /* its d-flex would otherwise override hidden */
+    #map-legend[hidden] { display: none !important; }
+
+    /* Best efforts: medals carry their rank as text too ("PR", "2nd", "3rd"), never color alone */
+    .effort-row { cursor: pointer; }
+    .effort-row:hover, .effort-row:focus-visible, .effort-row.is-active { background: #dee2e6; outline: none; }
+    .effort-name { min-width: 6.5rem; font-weight: 600; }
+    .medal {
+      margin-left: auto; font-size: 0.75rem; font-weight: 700; padding: 0.15rem 0.55rem;
+      border-radius: 999px; color: #212529; white-space: nowrap;
+    }
+    .medal-1 { background: #f5c542; }
+    .medal-2 { background: #ced4da; }
+    .medal-3 { background: #e0a370; }  /* its d-flex would otherwise override hidden */
     .stat-value { font-size: clamp(1.05rem, 5vw, 1.5rem); }
 
     #pace-chart, #elev-chart { height: 200px; }
@@ -149,7 +161,7 @@
           <path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z"/>
         </svg>
         <div class="flex-grow-1">
-          <div class="text-muted small">Fastest mile ever</div>
+          <div class="text-muted small">Fastest mile split ever</div>
           <div><span id="record-pace" class="stat-value fw-bold"></span> <span id="record-detail" class="text-muted small"></span></div>
         </div>
         <span id="record-badge" class="badge text-bg-warning" hidden></span>
@@ -162,7 +174,7 @@
       <div id="map-legend" class="card-footer small text-muted d-flex flex-wrap gap-3" hidden>
         <span><span class="legend-dot"></span> Mile</span>
         <span id="legend-fastest"><span class="legend-dot fastest"></span> Fastest this run</span>
-        <span id="legend-star"><svg class="legend-star" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z"/></svg> Fastest mile ever</span>
+        <span id="legend-star"><svg class="legend-star" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z"/></svg> Fastest mile split ever</span>
       </div>
     </div>
 
@@ -185,6 +197,14 @@
       <ul id="splits-list" class="list-group list-group-flush">
         <li class="list-group-item text-muted">No splits yet</li>
       </ul>
+    </div>
+
+    <div id="efforts-card" class="card bg-secondary-subtle text-dark mb-4" hidden>
+      <div class="card-header d-flex justify-content-between align-items-center">
+        Best Efforts
+        <span class="small text-muted">hover or tap to see it on the map</span>
+      </div>
+      <ul id="efforts-list" class="list-group list-group-flush"></ul>
     </div>
 
     {% if run_id %}
@@ -474,10 +494,10 @@
     let lastPathLatLngs = [];
     let lastMapSplits = [];
 
-    // --- Mile highlight, like Strava: hovering (or tapping) a mile marker or
-    // a point on the pace chart draws that mile's exact stretch of the route
-    // in white with a dark outline, so it stands out on white roads too.
-    let highlight = null;  // { mile, source: 'marker' | 'chart', layers }
+    // --- Stretch highlight, like Strava: hovering (or tapping) a mile marker,
+    // a point on the pace chart, or a best effort draws that exact stretch of
+    // the route in white with a dark outline, so it stands out on white roads too.
+    let highlight = null;  // { key: 'mile:3' | 'effort:5k', source: 'marker' | 'chart' | 'effort', layers }
 
     function mileStretch(mile) {
       const i = lastMapSplits.findIndex(s => s.mile === mile);
@@ -492,13 +512,24 @@
     }
 
     function highlightMile(mile, source) {
+      highlightStretch(`mile:${mile}`, () => mileStretch(mile), source);
+    }
+
+    function highlightEffort(effort) {
+      highlightStretch(`effort:${effort.key}`, () => {
+        const points = lastPathLatLngs.slice(effort.path_start, effort.path_end + 1);
+        return points.length >= 2 ? points : null;
+      }, 'effort');
+    }
+
+    function highlightStretch(key, getPoints, source) {
       if (!mapReady) return;
-      if (highlight && highlight.mile === mile) {
+      if (highlight && highlight.key === key) {
         highlight.source = source;
         return;
       }
       clearHighlight();
-      const points = mileStretch(mile);
+      const points = getPoints();
       if (!points) return;
       const style = { interactive: false, lineCap: 'round', lineJoin: 'round' };
       const layers = [
@@ -506,7 +537,7 @@
         L.polyline(points, { ...style, color: '#ffffff', weight: 5, opacity: 1 }).addTo(map),
       ];
       if (currentMarker) currentMarker.bringToFront();  // keep the runner's dot on top
-      highlight = { mile, source, layers };
+      highlight = { key, source, layers };
     }
 
     // With a source, only clears a highlight that source made - so the chart
@@ -560,7 +591,7 @@
         if (s.lat == null || s.lon == null) continue;
         seen.add(s.mile);
         const kind = s.mile === recordMile ? 'record' : (s.mile === fastestMile ? 'fastest' : 'mile');
-        const note = kind === 'record' ? 'Fastest mile ever' : (kind === 'fastest' ? 'Fastest this run' : '');
+        const note = kind === 'record' ? 'Fastest mile split ever' : (kind === 'fastest' ? 'Fastest this run' : '');
         const climb = s.elevation_gain_ft != null ? `<br>↑${s.elevation_gain_ft} ft ↓${s.elevation_loss_ft} ft` : '';
         const tooltip =
           `<strong>Mile ${s.mile}</strong>: ${s.pace_display}${climb}<br>` +
@@ -1004,6 +1035,72 @@
 
     window.addEventListener('resize', renderElevationChart);
 
+    // --- Best efforts card: the shown run's fastest stretch at each distance,
+    // with gold/silver/bronze when it's among the top 3 real runs ever.
+    const MEDAL_TEXT = { 1: 'PR', 2: '2nd', 3: '3rd' };
+    const MEDAL_LABELS = { 1: 'gold, personal record', 2: 'silver, 2nd best ever', 3: 'bronze, 3rd best ever' };
+    let activeEffortKey = null;
+
+    function showEffort(effort) {
+      activeEffortKey = effort.key;
+      document.querySelectorAll('.effort-row').forEach(r => r.classList.toggle('is-active', r.dataset.key === effort.key));
+      highlightEffort(effort);
+    }
+
+    function hideEffort() {
+      activeEffortKey = null;
+      document.querySelectorAll('.effort-row').forEach(r => r.classList.remove('is-active'));
+      clearHighlight('effort');
+    }
+
+    function renderEfforts(efforts) {
+      efforts = efforts || [];
+      document.getElementById('efforts-card').hidden = efforts.length === 0;
+      const list = document.getElementById('efforts-list');
+      const signature = JSON.stringify(efforts.map(e => [e.key, e.seconds, e.rank, e.path_start, e.path_end]));
+      if (list.dataset.signature === signature) return;  // unchanged - leave the rows (and any hover) alone
+      list.dataset.signature = signature;
+      if (activeEffortKey) hideEffort();
+      list.replaceChildren();
+      for (const effort of efforts) {
+        const row = document.createElement('li');
+        row.className = 'list-group-item d-flex align-items-center gap-2 effort-row';
+        row.tabIndex = 0;
+        row.dataset.key = effort.key;
+        const name = document.createElement('span');
+        name.className = 'effort-name';
+        name.textContent = effort.name;
+        const time = document.createElement('span');
+        time.className = 'fw-semibold';
+        time.textContent = effort.time_display;
+        const pace = document.createElement('span');
+        pace.className = 'small text-muted';
+        pace.textContent = effort.pace_display;
+        row.append(name, time, pace);
+        if (effort.rank) {
+          const medal = document.createElement('span');
+          medal.className = `medal medal-${effort.rank}`;
+          medal.textContent = MEDAL_TEXT[effort.rank];
+          medal.title = MEDAL_LABELS[effort.rank];
+          row.appendChild(medal);
+        }
+        row.setAttribute('aria-label', `${effort.name}: ${effort.time_display}, ${effort.pace_display}` +
+          (effort.rank ? `, ${MEDAL_LABELS[effort.rank]}` : '') + '. Shows the stretch on the map.');
+        // Mouse: hover. Touch: tap to show, tap again to hide. Keyboard: focus.
+        row.addEventListener('pointerenter', e => { if (e.pointerType === 'mouse') showEffort(effort); });
+        row.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') hideEffort(); });
+        row.addEventListener('pointerup', e => {
+          if (e.pointerType === 'mouse') return;
+          if (activeEffortKey === effort.key) hideEffort();
+          else showEffort(effort);
+        });
+        // Keyboard focus only - a tap also focuses the row, and pointerup handles taps.
+        row.addEventListener('focus', () => { if (row.matches(':focus-visible')) showEffort(effort); });
+        row.addEventListener('blur', () => { if (activeEffortKey === effort.key) hideEffort(); });
+        list.appendChild(row);
+      }
+    }
+
     // "↑79 ↓45 ft" for a split, or '' until its elevation is known
     // (about 40 m after the mile mark, once smoothing has passed it).
     function elevationText(split, prefix) {
@@ -1135,6 +1232,7 @@
         list.innerHTML = rows.length
           ? rows.join('')
           : '<li class="list-group-item text-muted">No splits yet</li>';
+        renderEfforts(data.best_efforts);
       } catch (err) {
         console.error('status refresh failed', err);
         if (RUN_ID) {
@@ -1196,6 +1294,7 @@
       ['dm_target_comparison', 'Compare to target pace ("8s faster than target")'],
       ['dm_new_record', 'New fastest mile ever'],
       ['dm_run_summary', 'End-of-run summary (with route map)'],
+      ['dm_best_efforts', 'Best efforts (after the run, when it earns a gold/silver/bronze)'],
       ['dm_pace_check', 'Pace check (a nudge when the last quarter mile is 15s+/mi slower than target)'],
     ];
     const DM_LABELS = Object.fromEntries(DM_SWITCHES);

@@ -58,6 +58,27 @@ ELEVATION_THRESHOLD_METERS = 4
 FEET_PER_METER = 3.28084
 
 
+# Best efforts: the fastest stretch of each standard distance anywhere in a
+# run, timed with moving time like splits. (key, display name, meters)
+BEST_EFFORT_DISTANCES = [
+    ("400m", "400 m", 400.0),
+    ("half_mile", "½ mile", MILE_METERS / 2),
+    ("1k", "1K", 1000.0),
+    ("1_mile", "1 mile", MILE_METERS),
+    ("2_mile", "2 mile", 2 * MILE_METERS),
+    ("5k", "5K", 5000.0),
+    ("10k", "10K", 10000.0),
+    ("15k", "15K", 15000.0),
+    ("10_mile", "10 mile", 10 * MILE_METERS),
+    ("20k", "20K", 20000.0),
+    ("half_marathon", "Half marathon", 21097.5),
+    ("30k", "30K", 30000.0),
+    ("marathon", "Marathon", 42195.0),
+]
+# Faster than this pace (seconds per mile) over any stretch is a GPS glitch, not running.
+FASTEST_PLAUSIBLE_PACE_SECONDS = 4 * 60
+
+
 class ClimbCounter:
     """Total gain/loss of a (smoothed) altitude series, ignoring wiggles smaller than the threshold."""
 
@@ -169,6 +190,68 @@ class RunTracker:
         self.elev_window = [0, 0, 0.0]  # lo index, hi index, altitude sum of samples[lo:hi]
         self.elev_profile = []  # smoothed: (run meters, altitude m, gain so far m, loss so far m, path index)
         self.climb = ClimbCounter(ELEVATION_THRESHOLD_METERS)
+
+        # Best efforts (see BEST_EFFORT_DISTANCES): every (meters, moving
+        # seconds, path index) the run has passed through, plus per distance
+        # a sliding-window start pointer and the best stretch found so far.
+        self.effort_samples = []
+        self.effort_window_start = {key: 0 for key, _, _ in BEST_EFFORT_DISTANCES}  # for stretches ending at a sample
+        self.effort_next_start = {key: 0 for key, _, _ in BEST_EFFORT_DISTANCES}  # for stretches starting at a sample
+        self.efforts = {}  # key -> (seconds, start meters, path index at start, path index at end)
+
+    def _consider_effort(self, key, meters, seconds, start_meters, path_start, path_end):
+        if seconds < meters / MILE_METERS * FASTEST_PLAUSIBLE_PACE_SECONDS:
+            return  # impossibly fast - GPS trouble, not a real effort
+        best = self.efforts.get(key)
+        if best is None or seconds < best[0]:
+            self.efforts[key] = (seconds, start_meters, path_start, path_end)
+
+    def _update_efforts(self):
+        """Check every stretch of each distance that the newest sample completes.
+
+        Moving time is linear between samples, so the fastest stretch always
+        starts or ends exactly at a sample - checking both kinds finds it
+        exactly. Two-pointer slides keep this cheap however long the run gets.
+        """
+        samples = self.effort_samples
+        end_meters, end_moving, end_path = samples[-1]
+        prev_meters, prev_moving, _ = samples[-2]
+        for key, _, meters in BEST_EFFORT_DISTANCES:
+            if end_meters < meters:
+                break  # distances are in increasing order
+            # Stretches ENDING at the newest sample: the start falls between samples i and i+1.
+            i = self.effort_window_start[key]
+            while samples[i + 1][0] <= end_meters - meters:
+                i += 1
+            self.effort_window_start[key] = i
+            (m0, t0, path0), (m1, t1, _) = samples[i], samples[i + 1]
+            start_meters = end_meters - meters
+            start_moving = t0 + (t1 - t0) * (start_meters - m0) / (m1 - m0)
+            self._consider_effort(key, meters, end_moving - start_moving, start_meters, path0, end_path)
+            # Stretches STARTING at a sample and ending inside the newest segment.
+            k = self.effort_next_start[key]
+            while samples[k][0] + meters <= end_meters:
+                stretch_end = samples[k][0] + meters
+                finish_moving = prev_moving + (end_moving - prev_moving) * (stretch_end - prev_meters) / (end_meters - prev_meters)
+                self._consider_effort(key, meters, finish_moving - samples[k][1], samples[k][0], samples[k][2], end_path)
+                k += 1
+            self.effort_next_start[key] = k
+
+    def best_efforts(self):
+        """This run's best effort at every distance it has covered, shortest distance first."""
+        out = []
+        for key, name, meters in BEST_EFFORT_DISTANCES:
+            effort = self.efforts.get(key)
+            if effort:
+                seconds, start_meters, path_start, path_end = effort
+                out.append({
+                    "key": key, "name": name, "seconds": round(seconds, 1),
+                    "time_display": format_duration(seconds),
+                    "pace_display": format_pace(seconds / (meters / MILE_METERS)),
+                    "start_meters": round(start_meters, 1),
+                    "path_start": path_start, "path_end": path_end,  # the stretch on the map path
+                })
+        return out
 
     def _add_altitude(self, altitude, step_meters):
         self.elev_track_meters += step_meters
@@ -339,6 +422,7 @@ class RunTracker:
             "elevation_gain_ft": round(self.climb.gain * FEET_PER_METER) if self.elev_profile else None,
             "elevation_loss_ft": round(self.climb.loss * FEET_PER_METER) if self.elev_profile else None,
             "elevation_profile": self._elevation_profile_for_chart(),
+            "best_efforts": self.best_efforts(),
         }
 
     def end(self):
@@ -394,6 +478,7 @@ class RunTracker:
 
         if self.distance_anchor is None:
             self.distance_anchor = (lat, lon, timestamp)
+            self.effort_samples.append((0.0, 0.0, len(self.path) - 1))  # efforts can start at the very start
             return None
 
         # iOS reports -1 when speed is unknown, so only trust non-negative values.
@@ -425,6 +510,8 @@ class RunTracker:
         self.moving_seconds += moving_portion
         self.distance_anchor = (lat, lon, timestamp)
         self.progress.append((self.cumulative_meters, self.moving_seconds))
+        self.effort_samples.append((self.cumulative_meters, self.moving_seconds, len(self.path) - 1))
+        self._update_efforts()
 
         if self.cumulative_meters < self.next_checkpoint_meters:
             return None

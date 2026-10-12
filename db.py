@@ -172,8 +172,22 @@ def _upsert_splits(cur, run_id, summary, available):
     )
 
 
+def has_best_efforts_table():
+    return bool(columns("rst_best_efforts"))  # no columns = the table doesn't exist yet
+
+
+def _save_best_efforts(cur, run_id, efforts):
+    cur.execute("DELETE FROM rst_best_efforts WHERE run_id = %s", (run_id,))
+    if efforts:
+        cur.executemany(
+            "INSERT INTO rst_best_efforts (run_id, distance_key, seconds, start_meters) VALUES (%s, %s, %s, %s)",
+            [(run_id, e["key"], e["seconds"], e["start_meters"]) for e in efforts],
+        )
+
+
 def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
     elevation = has_elevation_columns()
+    efforts_table = has_best_efforts_table()
     split_columns = columns("rst_splits")
 
     def work(cur):
@@ -199,7 +213,46 @@ def finish_run(run_id, ended_at, summary, goal_reached, test_mode_used):
                 (summary.get("elevation_gain_ft"), summary.get("elevation_loss_ft"), run_id),
             )
         _upsert_splits(cur, run_id, summary, split_columns)
+        if efforts_table:
+            _save_best_efforts(cur, run_id, summary.get("best_efforts") or [])
+        else:
+            logger.warning("DB: no rst_best_efforts table yet - run %s best efforts not saved", run_id)
     _transaction(work)
+
+
+def runs_missing_best_efforts():
+    """Finished runs with no saved best efforts (saved before they existed, or too short for any)."""
+    def work(cur):
+        cur.execute(
+            "SELECT r.id FROM rst_runs r WHERE r.status = 'completed' AND r.distance_miles >= 0.25"
+            " AND NOT EXISTS (SELECT 1 FROM rst_best_efforts e WHERE e.run_id = r.id) ORDER BY r.id"
+        )
+        return [row[0] for row in cur.fetchall()]
+    return _transaction(work)
+
+
+def save_best_efforts(run_id, efforts):
+    _transaction(lambda cur: _save_best_efforts(cur, run_id, efforts))
+
+
+def load_best_effort_leaders(per_distance=3):
+    """{distance key: [{seconds, run_id, started_at, timezone}, ...]} - the
+    fastest per_distance real runs at each distance (each run's own best
+    only), fastest first; on a tie the earlier run ranks higher."""
+    def work(cur):
+        cur.execute(
+            "SELECT e.distance_key, e.seconds, e.run_id, r.started_at, r.timezone"
+            " FROM rst_best_efforts e JOIN rst_runs r ON r.id = e.run_id"
+            " WHERE r.status = 'completed' AND r.test_mode = 0 AND r.excluded = 0"
+            " ORDER BY e.distance_key, e.seconds, r.started_at"
+        )
+        return cur.fetchall()
+    leaders = {}
+    for key, seconds, run_id, started_at, timezone_name in _transaction(work):
+        entries = leaders.setdefault(key, [])
+        if len(entries) < per_distance:
+            entries.append({"seconds": float(seconds), "run_id": run_id, "started_at": started_at, "timezone": timezone_name})
+    return leaders
 
 
 def runs_missing_elevation():

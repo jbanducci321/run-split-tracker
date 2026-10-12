@@ -15,15 +15,44 @@
     .run-card .btn-delete { position: relative; z-index: 2; }  /* above the card-wide link */
     .run-meta { color: #495057; }
     .min-w-0 { min-width: 0; }
+    .nav-pills .nav-link { color: #dee2e6; }
+    .nav-pills .nav-link.active { color: #fff; }
+    .efforts-table { table-layout: fixed; }
+    .efforts-table th:first-child { width: 7.5rem; }
+    .efforts-table td { vertical-align: top; }
+    .effort-when { font-size: 0.75rem; color: #495057; }
+    /* Medals carry their rank as text too ("PR", "2nd", "3rd"), never color alone */
+    .medal { font-size: 0.75rem; font-weight: 700; padding: 0.1rem 0.5rem; border-radius: 999px; color: #212529; white-space: nowrap; }
+    .medal-1 { background: #f5c542; }
+    .medal-2 { background: #ced4da; }
+    .medal-3 { background: #e0a370; }
+    @media (max-width: 480px) {
+      .efforts-table th:first-child { width: 5.2rem; }
+      .efforts-table { font-size: 0.85rem; }
+    }
   </style>
 </head>
 <body class="bg-dark text-light">
   <div class="container py-3 py-md-5" style="max-width: 760px;">
-    <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
       <h1 class="h3 mb-0">Past Runs</h1>
       <a href="/" class="btn btn-sm btn-outline-light">&larr; Live dashboard</a>
     </div>
 
+    <div class="nav nav-pills mb-4" role="tablist">
+      <button class="nav-link" id="tab-runs" data-tab="runs" role="tab" aria-controls="panel-runs">Runs</button>
+      <button class="nav-link" id="tab-efforts" data-tab="efforts" role="tab" aria-controls="panel-efforts">Best efforts</button>
+    </div>
+
+    <div id="panel-efforts" role="tabpanel" aria-labelledby="tab-efforts" hidden>
+      <p class="small" style="color: #adb5bd;">
+        Your 3 fastest runs at each distance - the fastest stretch of that distance anywhere in a run,
+        timed with moving time. Each run counts once per distance; test runs never count.
+      </p>
+      <div id="efforts-board" aria-live="polite"><div class="text-secondary">Loading best efforts...</div></div>
+    </div>
+
+    <div id="panel-runs" role="tabpanel" aria-labelledby="tab-runs">
     <div id="totals" class="row g-2 g-md-3 mb-4" hidden>
       <div class="col-6 col-md-3">
         <div class="card bg-secondary-subtle text-dark h-100"><div class="card-body text-center">
@@ -58,6 +87,7 @@
 
     <div id="runs-list" aria-live="polite">
       <div class="text-secondary">Loading runs...</div>
+    </div>
     </div>
 
     <div class="mt-4">
@@ -324,6 +354,7 @@
         runs = runs.filter(r => r.id !== run.id);
         render();
         setStatus(`Deleted the run from ${label}.`, 'ok');
+        effortsLoaded = false;  // its medals may have changed hands
         loadRuns();  // the fastest-mile star may have moved to another run
       } catch (err) {
         console.error('delete failed', err);
@@ -343,6 +374,7 @@
           return;
         }
         setStatus(`Deleted ${data.deleted.length} test run${data.deleted.length === 1 ? '' : 's'}.`, 'ok');
+        effortsLoaded = false;
         loadRuns();
       } catch (err) {
         console.error('bulk delete failed', err);
@@ -393,6 +425,81 @@
       }
     });
 
+    // --- Tabs: Runs / Best efforts. "#efforts" in the address opens the second,
+    // so the leaderboard can be linked directly.
+    let effortsLoaded = false;
+
+    function showTab(name) {
+      for (const tab of ['runs', 'efforts']) {
+        const active = tab === name;
+        const button = document.getElementById(`tab-${tab}`);
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+        document.getElementById(`panel-${tab}`).hidden = !active;
+      }
+      history.replaceState(null, '', name === 'efforts' ? '#efforts' : location.pathname);
+      if (name === 'efforts' && !effortsLoaded) loadEfforts();
+    }
+
+    document.querySelectorAll('[data-tab]').forEach(button =>
+      button.addEventListener('click', () => showTab(button.dataset.tab)));
+
+    // "Oct 7" (plus the year if it isn't this year), where the run started.
+    function shortDate(entry) {
+      const started = new Date(entry.started_at);
+      if (isNaN(started)) return '';
+      const timeZone = zoneOf(entry);
+      const yearOf = d => new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric' }).format(d);
+      return new Intl.DateTimeFormat('en-US', {
+        timeZone, month: 'short', day: 'numeric', ...(yearOf(started) !== yearOf(new Date()) ? { year: 'numeric' } : {}),
+      }).format(started);
+    }
+
+    async function loadEfforts() {
+      const board = document.getElementById('efforts-board');
+      try {
+        const res = await fetch('/api/best-efforts');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          board.replaceChildren(el('div', { class: 'text-danger', text: data.error || "Couldn't load best efforts." }));
+          return;
+        }
+        effortsLoaded = true;
+        if (!data.distances.length) {
+          board.replaceChildren(el('div', { class: 'text-secondary', text: 'No best efforts yet - they show up after your first tracked run.' }));
+          return;
+        }
+        const medalHeader = rank => el('th', { scope: 'col' }, [
+          el('span', { class: `medal medal-${rank}`, text: { 1: 'PR', 2: '2nd', 3: '3rd' }[rank], title: { 1: 'Gold', 2: 'Silver', 3: 'Bronze' }[rank] }),
+        ]);
+        const head = el('thead', {}, [el('tr', {}, [el('th', { scope: 'col', text: 'Distance' }), medalHeader(1), medalHeader(2), medalHeader(3)])]);
+        const body = el('tbody');
+        for (const distance of data.distances) {
+          const cells = [el('th', { scope: 'row', text: distance.name })];
+          for (let rank = 1; rank <= 3; rank++) {
+            const entry = distance.entries[rank - 1];
+            cells.push(entry
+              ? el('td', {}, [
+                  el('a', {
+                    href: `/runs/${entry.run_id}`, class: 'link-dark fw-semibold text-decoration-none',
+                    text: entry.time_display, title: `${entry.pace_display} - open this run`,
+                  }),
+                  el('div', { class: 'effort-when', text: shortDate(entry) }),
+                ])
+              : el('td', { class: 'text-muted', text: '-' }));
+          }
+          body.appendChild(el('tr', {}, cells));
+        }
+        board.replaceChildren(el('div', { class: 'card bg-secondary-subtle text-dark overflow-hidden' }, [
+          el('table', { class: 'table table-sm mb-0 efforts-table' }, [head, body]),
+        ]));
+      } catch (err) {
+        console.error('loading best efforts failed', err);
+        board.replaceChildren(el('div', { class: 'text-danger', text: "Couldn't load best efforts - check your connection and refresh." }));
+      }
+    }
+
+    showTab(location.hash === '#efforts' ? 'efforts' : 'runs');
     loadRuns();
   </script>
 </body>

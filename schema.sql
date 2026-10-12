@@ -77,6 +77,19 @@ CREATE TABLE rst_run_conditions (
     CONSTRAINT fk_rst_conditions_run FOREIGN KEY (run_id) REFERENCES rst_runs (id) ON DELETE CASCADE
 );
 
+-- Each run's fastest stretch at each standard distance (400 m up to the
+-- marathon), timed with moving time. Gold/silver/bronze are just the top 3
+-- per distance across real runs, so they aren't stored.
+CREATE TABLE rst_best_efforts (
+    run_id INT NOT NULL,
+    distance_key VARCHAR(20) NOT NULL,               -- '5k', '1_mile', 'half_marathon', ... (split_tracker.py)
+    seconds DECIMAL(8,1) NOT NULL,
+    start_meters DECIMAL(8,1) NOT NULL,              -- where in the run the stretch began
+    PRIMARY KEY (run_id, distance_key),
+    KEY idx_distance_seconds (distance_key, seconds),
+    CONSTRAINT fk_rst_efforts_run FOREIGN KEY (run_id) REFERENCES rst_runs (id) ON DELETE CASCADE
+);
+
 -- Admin settings (goal distance, target pace, test mode) so they survive restarts.
 CREATE TABLE rst_settings (
     setting_key VARCHAR(50) NOT NULL,
