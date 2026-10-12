@@ -2,6 +2,7 @@ import hmac
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from collections import Counter, OrderedDict, deque
@@ -20,7 +21,26 @@ from split_tracker import (
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+
+def configure_logging():
+    """INFO lines to stdout, warnings and errors to stderr - Railway shows
+    every stderr line in red, so red should mean a real problem. (Gunicorn's
+    own lines are split the same way in gunicorn.conf.py.)"""
+    root = logging.getLogger()
+    if root.handlers:
+        return  # something (a test runner, say) has already set logging up
+    formatter = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+    to_stdout = logging.StreamHandler(sys.stdout)
+    to_stdout.addFilter(lambda record: record.levelno < logging.WARNING)
+    to_stderr = logging.StreamHandler(sys.stderr)
+    to_stderr.setLevel(logging.WARNING)
+    for handler in (to_stdout, to_stderr):
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+configure_logging()
 logger = logging.getLogger("run-split-tracker")
 
 # Raw points are buffered and written as one compressed chunk about once a

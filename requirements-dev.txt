@@ -1,0 +1,3 @@
+# For running the tests (pytest). Railway installs requirements.txt only.
+-r requirements.txt
+pytest>=8.0
