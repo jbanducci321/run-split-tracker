@@ -10,6 +10,10 @@
     #map { height: 320px; width: 100%; border-radius: 0.375rem; background: #444; }
     #splits-list { max-height: 260px; overflow-y: auto; }
     .run-time { color: #adb5bd; margin-top: 0.15rem; }
+    #update-age.stale { color: #ffc107; font-weight: 600; }
+    #map.dark-map { background: #262626; }
+    /* Tiles only - lines, markers and controls sit in other panes and keep their colors. */
+    #map.dark-map .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9); }
 
     /* Follow button: filled arrow = locked on the runner, outline = free roam */
     .follow-btn {
@@ -82,7 +86,10 @@
         <div id="run-time" class="run-time small" hidden></div>
         <div id="run-weather" class="run-time small" hidden></div>
       </div>
-      <span id="status-badge" class="badge bg-secondary fs-6">Loading...</span>
+      <div class="text-end">
+        <span id="status-badge" class="badge bg-secondary fs-6">Loading...</span>
+        <div id="update-age" class="run-time small mt-1" role="status" hidden></div>
+      </div>
     </div>
 
     <div id="run-error" class="alert alert-secondary" hidden></div>
@@ -267,6 +274,13 @@
             </div>
           </div>
           <div class="mt-3">
+            <div class="form-label small text-muted mb-1">Display</div>
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" role="switch" id="dark_map">
+              <label class="form-check-label small" for="dark_map">Dark map (for everyone viewing the site)</label>
+            </div>
+          </div>
+          <div class="mt-3">
             <div class="form-label small text-muted mb-1">Discord updates</div>
             <div class="form-check form-switch">
               <input class="form-check-input" type="checkbox" role="switch" id="dm_muted">
@@ -311,6 +325,14 @@
     const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     const map = mapReady ? L.map('map').setView([0, 0], 2) : null;
+
+    // Map style - the admin's "Dark map" switch, applied for every viewer. The
+    // same OpenStreetMap tiles, color-inverted by CSS (see .dark-map) - free
+    // dark tile services now need an API key, and this keeps the route,
+    // markers and dots in their normal colors.
+    function setDarkMap(on) {
+      document.getElementById('map').classList.toggle('dark-map', on);
+    }
     let routeLine = null;
     let currentMarker = null;
     let mapCentered = false;
@@ -989,6 +1011,39 @@
       return `${prefix}<span class="text-muted small">↑${split.elevation_gain_ft} ↓${split.elevation_loss_ft} ft</span>`;
     }
 
+    // --- "Updated 6s ago" under the badge during a run, so viewers can tell a
+    // stop at a light from a phone that has lost signal.
+    const STALE_AFTER_SECONDS = 60;
+    let updateAge = null;  // { seconds: age when last fetched, at: Date.now() then }
+    let serverReachable = true;
+
+    function formatAge(seconds) {
+      if (seconds < 60) return `${seconds}s`;
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+      return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+    }
+
+    function renderUpdateAge() {
+      const el = document.getElementById('update-age');
+      if (!serverReachable) {
+        el.textContent = "Can't reach the server - retrying";
+        el.classList.add('stale');
+        el.hidden = false;
+        return;
+      }
+      if (!updateAge) {
+        el.hidden = true;
+        return;
+      }
+      const age = updateAge.seconds + Math.floor((Date.now() - updateAge.at) / 1000);
+      const stale = age >= STALE_AFTER_SECONDS;
+      el.textContent = stale ? `No GPS update for ${formatAge(age)} - phone may have lost signal` : `Updated ${age}s ago`;
+      el.classList.toggle('stale', stale);
+      el.hidden = false;
+    }
+
+    if (!RUN_ID) setInterval(renderUpdateAge, 1000);  // count up between the 3s refreshes
+
     function showRunError(message) {
       const box = document.getElementById('run-error');
       box.textContent = message;
@@ -1011,6 +1066,12 @@
           return;
         }
         document.getElementById('run-error').hidden = true;
+        setDarkMap(!!data.dark_map);
+        if (!RUN_ID) {
+          serverReachable = true;
+          updateAge = data.seconds_since_update != null ? { seconds: data.seconds_since_update, at: Date.now() } : null;
+          renderUpdateAge();
+        }
 
         const badge = document.getElementById('status-badge');
         if (RUN_ID) {
@@ -1076,7 +1137,12 @@
           : '<li class="list-group-item text-muted">No splits yet</li>';
       } catch (err) {
         console.error('status refresh failed', err);
-        if (RUN_ID) showRunError("Couldn't load this run - check your connection and refresh.");
+        if (RUN_ID) {
+          showRunError("Couldn't load this run - check your connection and refresh.");
+        } else {
+          serverReachable = false;
+          renderUpdateAge();
+        }
       }
     }
 
@@ -1154,6 +1220,7 @@
     function fillAdminControls(data) {
       for (const [name] of DM_SWITCHES) document.getElementById(name).checked = !!data[name];
       document.getElementById('dm_muted').checked = !!data.dm_muted;
+      document.getElementById('dark_map').checked = !!data.dark_map;
       document.getElementById('dm-muted-note').hidden = !data.dm_muted;
       dmSwitchBox.style.opacity = data.dm_muted ? 0.5 : 1;  // still editable, just visibly overridden
       document.getElementById('admin-goal-enabled').checked = !!data.goal_enabled && data.goal_distance_miles != null;
@@ -1337,6 +1404,9 @@
     const muteInput = document.getElementById('dm_muted');
     muteInput.addEventListener('change', () =>
       saveSwitch(muteInput, 'dm_muted', on => (on ? 'All DMs muted.' : 'DMs unmuted - your switches apply again.')));
+    const darkMapInput = document.getElementById('dark_map');
+    darkMapInput.addEventListener('change', () =>
+      saveSwitch(darkMapInput, 'dark_map', on => (on ? 'Dark map on for everyone.' : 'Light map on for everyone.')));
     const goalSwitch = document.getElementById('admin-goal-enabled');
     goalSwitch.addEventListener('change', () =>
       saveSwitch(goalSwitch, 'goal_enabled', on => (on ? 'Goal on.' : 'Goal off (distance kept for later).')));

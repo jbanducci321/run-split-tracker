@@ -65,6 +65,7 @@ admin_state = {
     "target_pace_seconds": None,  # kept while disabled, so toggling back on restores it
     "six_seven_enabled": False,
     "six_seven_test_mode": False,  # sends the 6.7 DM to you instead of SIX_SEVEN_DISCORD_ID
+    "dark_map": False,  # dark map tiles on the site, for everyone viewing it
     # Discord update switches (admin panel). Muting silences every automatic
     # DM without changing the individual switches.
     "dm_muted": False,
@@ -107,6 +108,7 @@ last_summary = None  # most recently finished trip, kept until a new one starts
 last_test_dm_time = None  # timestamp (from GPS data, not wall clock) of the last test-mode DM
 trip_announced = False  # whether this trip's "Tracking started" DM has gone out
 announce_thread = None
+last_overland_update = None  # monotonic time Overland last sent points for a trip
 
 
 def effective_target_pace():
@@ -722,6 +724,12 @@ def build_status_payload(stats, run_id=None, counts_for_records=False, goal=CURR
     stats["goal_distance_miles"] = goal
     stats["goal_progress_percent"] = None
     stats["eta_display"] = None
+    stats["dark_map"] = admin_state["dark_map"]
+    # How long since Overland last sent anything for the run in progress, so
+    # viewers can tell "standing at a light" from "phone lost signal".
+    stats["seconds_since_update"] = (
+        round(time.monotonic() - last_overland_update) if stats["active"] and last_overland_update else None
+    )
 
     if goal:
         stats["goal_progress_percent"] = round(min(stats["distance_miles"] / goal, 1) * 100, 1)
@@ -1062,7 +1070,7 @@ def admin_six_seven_test():
 
 @app.post("/overland")
 def receive_overland_batch():
-    global last_summary, last_test_dm_time, trip_announced, announce_thread
+    global last_summary, last_test_dm_time, trip_announced, announce_thread, last_overland_update
 
     if not is_authorized(request.headers.get("Authorization", "")):
         return jsonify(error="unauthorized"), 401
@@ -1120,6 +1128,7 @@ def receive_overland_batch():
     if ping_window["updates"] == 0:
         ping_window["started"] = time.monotonic()  # window starts at its first update, not at idle time
     ping_window["updates"] += 1
+    last_overland_update = time.monotonic()
     ping_window["points"] += len(locations)
 
     points.sort(key=lambda p: p[2])
