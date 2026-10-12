@@ -57,6 +57,15 @@ ELEVATION_SMOOTHING_METERS = 80
 ELEVATION_THRESHOLD_METERS = 4
 FEET_PER_METER = 3.28084
 
+# Before smoothing, glitches are dropped: the phone occasionally jumps between
+# two altitude readings ~12 m apart for a few seconds (seen at the start of a
+# run, as its altitude settles). A reading more than ALTITUDE_GLITCH_METERS
+# from the median of the readings within ALTITUDE_GLITCH_WINDOW_SECONDS
+# either side of it is dropped. Real hills change gradually, so on a steady
+# climb the median is the reading itself and nothing real is lost.
+ALTITUDE_GLITCH_WINDOW_SECONDS = 30
+ALTITUDE_GLITCH_METERS = 8
+
 
 # Best efforts: the fastest stretch of each standard distance anywhere in a
 # run, timed with moving time like splits. (key, display name, meters)
@@ -186,7 +195,9 @@ class RunTracker:
         # Elevation (see ELEVATION_SMOOTHING_METERS). Each accepted point's
         # altitude is smoothed once the route has gone half a window past it.
         self.elev_track_meters = 0.0  # point-to-point distance along accepted points (the smoothing axis)
-        self.elev_samples = []  # (track meters, run meters, altitude m, path index)
+        self.elev_pending = []  # (seconds, track meters, run meters, altitude m, path index) awaiting the glitch check
+        self.elev_checked = 0  # how many of elev_pending have been checked
+        self.elev_samples = []  # glitch-free: (track meters, run meters, altitude m, path index)
         self.elev_window = [0, 0, 0.0]  # lo index, hi index, altitude sum of samples[lo:hi]
         self.elev_profile = []  # smoothed: (run meters, altitude m, gain so far m, loss so far m, path index)
         self.climb = ClimbCounter(ELEVATION_THRESHOLD_METERS)
@@ -253,12 +264,42 @@ class RunTracker:
                 })
         return out
 
-    def _add_altitude(self, altitude, step_meters):
+    def _add_altitude(self, altitude, step_meters, timestamp):
         self.elev_track_meters += step_meters
         if altitude is None:
             return
-        self.elev_samples.append((self.elev_track_meters, self.cumulative_meters, float(altitude), len(self.path) - 1))
-        self._smooth_altitudes(final=False)
+        self.elev_pending.append(
+            (timestamp.timestamp(), self.elev_track_meters, self.cumulative_meters, float(altitude), len(self.path) - 1)
+        )
+        self._drop_altitude_glitches(final=False)
+
+    def _drop_altitude_glitches(self, final):
+        """Check every pending reading whose window (or, at the end of the
+        run, every remaining one) is complete; pass the good ones on to smoothing."""
+        pending, window = self.elev_pending, ALTITUDE_GLITCH_WINDOW_SECONDS
+        passed = False
+        while self.elev_checked < len(pending):
+            k = self.elev_checked
+            seconds, track, run_meters, altitude, path_index = pending[k]
+            if not final and pending[-1][0] < seconds + window:
+                break  # readings from the next half-minute haven't all arrived yet
+            nearby = [altitude]
+            j = k - 1
+            while j >= 0 and pending[j][0] >= seconds - window:
+                nearby.append(pending[j][3])
+                j -= 1
+            j = k + 1
+            while j < len(pending) and pending[j][0] <= seconds + window:
+                nearby.append(pending[j][3])
+                j += 1
+            nearby.sort()
+            median = nearby[len(nearby) // 2]
+            if abs(altitude - median) <= ALTITUDE_GLITCH_METERS:
+                self.elev_samples.append((track, run_meters, altitude, path_index))
+                passed = True
+            self.elev_checked += 1
+        if passed or final:
+            self._smooth_altitudes(final=final)
 
     def _smooth_altitudes(self, final):
         """Smooth every sample whose full window is now known (or, at the end
@@ -426,7 +467,7 @@ class RunTracker:
         }
 
     def end(self):
-        self._smooth_altitudes(final=True)  # the last ~40 m had no window ahead of them yet
+        self._drop_altitude_glitches(final=True)  # the last ~30 s / ~40 m had no window ahead of them yet
         summary = self.current_stats()
         summary["active"] = False
         summary["paused"] = False
@@ -474,7 +515,7 @@ class RunTracker:
         smoothed_lon = sum(p[1] for p in self.raw_buffer) / len(self.raw_buffer)
         self.last_smoothed_point = (smoothed_lat, smoothed_lon)
         self.path.append((smoothed_lat, smoothed_lon))
-        self._add_altitude(altitude, raw_distance)  # every accepted point, moving or not
+        self._add_altitude(altitude, raw_distance, timestamp)  # every accepted point, moving or not
 
         if self.distance_anchor is None:
             self.distance_anchor = (lat, lon, timestamp)
