@@ -59,12 +59,26 @@ MAX_TARGET_PACE_SECONDS = 10 * 60 + 59   # 10:59/mi
 # defaults until anything has been saved.
 admin_state = {
     "discord_test_mode": os.environ.get("DISCORD_TEST_MODE", "false").lower() == "true",
-    "goal_distance_miles": None,
+    "goal_enabled": True,
+    "goal_distance_miles": None,  # kept while the goal is off, so toggling back on restores it
     "target_pace_enabled": False,
     "target_pace_seconds": None,  # kept while disabled, so toggling back on restores it
     "six_seven_enabled": False,
     "six_seven_test_mode": False,  # sends the 6.7 DM to you instead of SIX_SEVEN_DISCORD_ID
+    # Discord update switches (admin panel). Muting silences every automatic
+    # DM without changing the individual switches.
+    "dm_muted": False,
+    "dm_tracking_started": True,
+    "dm_mile_splits": True,
+    "dm_half_mile": True,
+    "dm_goal_halfway": True,
+    "dm_goal_reached": True,
+    "dm_target_comparison": True,  # the "(8s faster than target)" part of pace DMs
+    "dm_new_record": True,
+    "dm_run_summary": True,
+    "dm_pace_check": False,  # off by default - it's the one most likely to nag
 }
+BOOLEAN_SETTINGS = {name for name, value in admin_state.items() if isinstance(value, bool)}
 
 # Once per trip, the first time it passes 6.7 miles, DM SIX_SEVEN_DISCORD_ID
 # (a friend) a message plus a picture of the route so far.
@@ -99,8 +113,120 @@ def effective_target_pace():
     return admin_state["target_pace_seconds"] if admin_state["target_pace_enabled"] else None
 
 
+def effective_goal():
+    return admin_state["goal_distance_miles"] if admin_state["goal_enabled"] else None
+
+
+def dm_allowed(toggle=None):
+    return not admin_state["dm_muted"] and (toggle is None or admin_state[toggle])
+
+
+def notify(message, toggle=None, **kwargs):
+    """Send an automatic DM, unless DMs are muted or its own switch is off.
+    Returns whether it was sent. (The 6.7 test button calls send_dm directly -
+    pressing it is an explicit request, so it ignores these.)"""
+    if not dm_allowed(toggle):
+        logger.info("DM skipped (%s): %s", "all DMs muted" if admin_state["dm_muted"] else f"{toggle} off", message)
+        return False
+    return send_dm(message, **kwargs)
+
+
+def pace_gap_text(diff_seconds):
+    diff = abs(round(diff_seconds))
+    return f"{diff}s" if diff < 60 else f"{diff // 60}:{diff % 60:02d}"
+
+
+# --- New-record, pace-check and run-summary DMs.
+
+def new_record_message(event):
+    """'New fastest mile ever!' text if this just-finished mile beats the
+    all-time record - and every faster mile earlier in this run - else None.
+    Uses the same rules as the dashboard star: real runs only, 4:00 floor."""
+    record = best_mile["record"]
+    if tracker.test_mode_used or not best_mile["loaded"] or record is None:
+        return None  # no saved record yet means nothing to beat
+    pace = round(event["pace_seconds"], 1)
+    if pace < MIN_RECORD_PACE_SECONDS or pace >= record["pace_seconds"]:
+        return None
+    earlier = [round(s["pace_seconds"], 1) for s in tracker.splits[:-1] if s["pace_seconds"] >= MIN_RECORD_PACE_SECONDS]
+    if earlier and min(earlier) <= pace:
+        return None  # already ran a faster record-breaking mile this run
+    previous_best = min([record["pace_seconds"], *earlier])
+    return f"New fastest mile ever! Mile {event['mile']} - {event['pace_display']} (previous best {format_pace(previous_best)})"
+
+
+# Pace check: a nudge when the last quarter mile has been well off the target.
+PACE_CHECK_WINDOW_METERS = 402        # about a quarter mile
+PACE_CHECK_SLOWER_BY_SECONDS = 15     # per mile slower than target before nudging
+PACE_CHECK_REARM_WITHIN_SECONDS = 5   # must get back within this of target before another nudge
+PACE_CHECK_MIN_GAP_SECONDS = 5 * 60   # and at least this much moving time between nudges
+PACE_CHECK_WARMUP_MILES = 0.5         # no nudges while still warming up
+
+
+def check_pace():
+    target = effective_target_pace()
+    if target is None or not admin_state["dm_pace_check"]:
+        return
+    if tracker.cumulative_meters < PACE_CHECK_WARMUP_MILES * MILE_METERS:
+        return
+    recent = tracker.recent_pace(PACE_CHECK_WINDOW_METERS)
+    if recent is None:
+        return
+    behind = recent - target
+    if not tracker.pace_alert_armed:
+        if behind <= PACE_CHECK_REARM_WITHIN_SECONDS:
+            tracker.pace_alert_armed = True  # back on pace - the next slowdown can nudge again
+        return
+    if behind < PACE_CHECK_SLOWER_BY_SECONDS:
+        return
+    last = tracker.last_pace_alert_moving
+    if last is not None and tracker.moving_seconds - last < PACE_CHECK_MIN_GAP_SECONDS:
+        return
+    tracker.pace_alert_armed = False
+    tracker.last_pace_alert_moving = tracker.moving_seconds
+    logger.info("PACE CHECK: %s over the last quarter mile vs target %s", format_pace(recent), format_pace(target))
+    notify(
+        f"Pace check: {format_pace(recent)} over the last quarter mile - "
+        f"{pace_gap_text(behind)} slower than your {format_pace(target)} target",
+        "dm_pace_check",
+    )
+
+
+RUN_SUMMARY_MIN_MILES = 0.05  # skip the summary for an accidental Start/Stop
+
+
+def run_summary_message(summary, goal_reached_miles):
+    """The end-of-run DM text, or None for a run too short to summarize."""
+    if summary["distance_miles"] < RUN_SUMMARY_MIN_MILES:
+        return None
+    lines = [
+        f"Run complete: {summary['distance_miles']:.2f} mi in {summary['moving_display']}"
+        f" - avg {summary['average_pace_display'] or 'unknown pace'}"
+    ]
+    fastest = summary["fastest_split"]
+    if fastest:
+        _, record_mile = record_status(summary["splits"], summary.get("run_id"), not summary.get("test_mode_used"))
+        record_note = " - fastest mile ever!" if record_mile == fastest["mile"] else ""
+        lines.append(f"Fastest mile: Mile {fastest['mile']} - {fastest['pace_display']}{record_note}")
+    if goal_reached_miles:
+        lines.append(f"Goal reached: {goal_reached_miles:.2f} mi")
+    site = public_site_url()
+    if site and summary.get("run_id"):
+        lines.append(f"\n<{site}/runs/{summary['run_id']}>")
+    return "\n".join(lines)
+
+
+def send_run_summary(message, path):
+    """Background: draw the route and send the end-of-run DM."""
+    if not dm_allowed("dm_run_summary"):
+        notify(message, "dm_run_summary")  # just logs why it was skipped - no map drawn for nothing
+        return
+    image = map_image.render_route_png(path) if path else None
+    notify(message, "dm_run_summary", image_png=image)
+
+
 def six_seven_message(average_pace_display):
-    goal = admin_state["goal_distance_miles"]
+    goal = effective_goal()
     goal_part = f" out of {goal:g} miles" if goal else ""
     message = f"{RUNNER_NAME} has run {SIX_SEVEN_MILES:g} miles{goal_part} in {average_pace_display or 'an unknown pace'}"
     site = public_site_url()
@@ -118,13 +244,21 @@ def send_six_seven(message, path, recipient_id, who):
     return sent, image is not None
 
 
+def send_six_seven_during_run(message, path, recipient_id, who):
+    """The real (mid-run) 6.7 DM - silenced by the master mute, like every automatic DM."""
+    if admin_state["dm_muted"]:
+        logger.info("DM skipped (all DMs muted): %s [6.7 DM to %s]", message, who)
+        return
+    send_six_seven(message, path, recipient_id, who)
+
+
 def setting_key(name):
     return f"{SETTINGS_SCOPE}:{name}"
 
 
 def clean_setting(name, value):
     """Re-validate a saved setting (it may have been edited by hand in the database)."""
-    if name in ("discord_test_mode", "target_pace_enabled", "six_seven_enabled", "six_seven_test_mode"):
+    if name in BOOLEAN_SETTINGS:
         if not isinstance(value, bool):
             raise ValueError(f"{name} must be true or false")
         return value
@@ -179,15 +313,15 @@ def persist_settings(updates):
 
 
 def target_note(pace_seconds):
-    """' (8s faster than target)' style suffix for DMs, or '' with no target set."""
+    """' (8s faster than target)' style suffix for DMs, or '' with no target
+    set or the target comparison switched off."""
     target = effective_target_pace()
-    if target is None or pace_seconds is None:
+    if target is None or pace_seconds is None or not admin_state["dm_target_comparison"]:
         return ""
     diff = round(pace_seconds - target)
     if diff == 0:
         return " (on target)"
-    gap = f"{abs(diff)}s" if abs(diff) < 60 else f"{abs(diff) // 60}:{abs(diff) % 60:02d}"
-    return f" ({gap} {'slower' if diff > 0 else 'faster'} than target)"
+    return f" ({pace_gap_text(diff)} {'slower' if diff > 0 else 'faster'} than target)"
 
 
 def apply_run_timezone(started, timezone_name):
@@ -211,7 +345,7 @@ def announce_trip_start(run_id, started, lat, lon, goal, target):
         message += f". Goal: {goal:.2f} mi"
     if target:
         message += f". Target pace: {format_pace(target)}"
-    send_dm(message)
+    notify(message, "dm_tracking_started")
 
     if not (PERSISTENCE_ENABLED and conditions):
         return
@@ -279,7 +413,7 @@ def ensure_run_recorded():
         recording["run_id"] = db.create_run(
             to_utc_naive(tracker.start_time),
             int(offset.total_seconds() // 60) if offset else None,
-            admin_state["goal_distance_miles"],
+            effective_goal(),
             effective_target_pace(),
             admin_state["discord_test_mode"],
             ALGORITHM_VERSION,
@@ -400,12 +534,15 @@ def recover_run(trip):
     # if they couldn't be loaded, fall back to what the run row recorded at
     # the start of this trip.
     if not settings_state["loaded"]:
-        admin_state["goal_distance_miles"] = float(goal) if goal is not None else None
+        if goal is not None:
+            admin_state.update(goal_distance_miles=float(goal), goal_enabled=True)
+        else:
+            admin_state["goal_enabled"] = False
         admin_state["discord_test_mode"] = bool(test_mode)
         if target is not None:
             admin_state.update(target_pace_seconds=int(target), target_pace_enabled=True)
     distance = tracker.cumulative_meters / MILE_METERS
-    goal = admin_state["goal_distance_miles"]
+    goal = effective_goal()
     tracker.goal_half_notified = bool(goal) and distance >= goal / 2
     tracker.goal_notified = bool(goal) and distance >= goal
     tracker.test_mode_used = tracker.test_mode_used or bool(test_mode)
@@ -542,7 +679,7 @@ CURRENT_SETTINGS = object()  # build_status_payload default: use today's admin g
 def build_status_payload(stats, run_id=None, counts_for_records=False, goal=CURRENT_SETTINGS, target=CURRENT_SETTINGS):
     """The dashboard's JSON. A past run passes the goal/target it was run with."""
     if goal is CURRENT_SETTINGS:
-        goal = admin_state["goal_distance_miles"]
+        goal = effective_goal()
     if target is CURRENT_SETTINGS:
         target = effective_target_pace()
     stats = dict(stats)
@@ -828,10 +965,18 @@ def admin_settings():
     # Validate everything first so a bad value can't leave settings half-applied.
     updates = {}
     try:
-        if "discord_test_mode" in data:
-            updates["discord_test_mode"] = bool(data["discord_test_mode"])
+        # On/off switches (goal_enabled and target_pace_enabled get extra checks below).
+        for name in sorted(BOOLEAN_SETTINGS - {"target_pace_enabled"}):
+            if name in data:
+                updates[name] = bool(data[name])
         if "goal_distance_miles" in data:
             updates["goal_distance_miles"] = validate_goal_distance(data["goal_distance_miles"])
+            if updates["goal_distance_miles"] is not None and "goal_enabled" not in data:
+                updates["goal_enabled"] = True  # setting a new goal switches it on
+        if updates.get("goal_enabled") and updates.get(
+            "goal_distance_miles", admin_state["goal_distance_miles"]
+        ) is None:
+            raise ValueError("set a goal distance before turning the goal on")
         if "target_pace_seconds" in data:
             updates["target_pace_seconds"] = validate_target_pace(data["target_pace_seconds"])
         if "target_pace_enabled" in data:
@@ -840,21 +985,13 @@ def admin_settings():
                 "target_pace_seconds", admin_state["target_pace_seconds"]
             ) is None:
                 raise ValueError("pick a target pace before enabling it")
-        for name in ("six_seven_enabled", "six_seven_test_mode"):
-            if name in data:
-                updates[name] = bool(data[name])
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     admin_state.update(updates)
     saved = persist_settings(updates)
 
     return jsonify(
-        discord_test_mode=admin_state["discord_test_mode"],
-        goal_distance_miles=admin_state["goal_distance_miles"],
-        target_pace_enabled=admin_state["target_pace_enabled"],
-        target_pace_seconds=admin_state["target_pace_seconds"],
-        six_seven_enabled=admin_state["six_seven_enabled"],
-        six_seven_test_mode=admin_state["six_seven_test_mode"],
+        **admin_state,
         six_seven_configured=bool(os.environ.get("SIX_SEVEN_DISCORD_ID")),
         saved=saved,  # False = applied, but couldn't be stored (resets on restart)
     )
@@ -909,7 +1046,9 @@ def receive_overland_batch():
         if tracker.active:
             log_ping_summary(force=True)  # the trip's last partial minute
             trip_announced = False
-            ended_at, goal_reached, test_mode_used = tracker.last_seen_time, tracker.goal_notified, tracker.test_mode_used
+            goal = effective_goal()
+            goal_reached = tracker.goal_notified or bool(goal and tracker.cumulative_meters >= goal * MILE_METERS)
+            ended_at, test_mode_used = tracker.last_seen_time, tracker.test_mode_used
             if test_mode_used:
                 discard_test_run()  # normally already done mid-run; this catches a run that ended first
             last_summary = tracker.end()
@@ -920,8 +1059,14 @@ def receive_overland_batch():
                 [s["pace_display"] for s in last_summary["splits"]],
                 " (test run - not saved)" if test_mode_used else "",
             )
+            # Built before finish_recording refreshes the record, so "fastest
+            # mile ever" compares against the record as it stood before this run.
+            summary_message = run_summary_message(last_summary, goal if goal_reached else None)
             if PERSISTENCE_ENABLED and not test_mode_used:
                 finish_recording(last_summary, ended_at, goal_reached)
+            if summary_message:
+                finished_path = list(last_summary["path"])
+                run_in_background(lambda: send_run_summary(summary_message, finished_path))
         return jsonify(result="ok")
 
     if not tracker.active and recording["run_id"] is None:
@@ -974,7 +1119,7 @@ def receive_overland_batch():
             if who:
                 message = six_seven_message(tracker.current_stats()["average_pace_display"])
                 threading.Thread(
-                    target=send_six_seven, args=(message, list(tracker.path), recipient, who), daemon=True,
+                    target=send_six_seven_during_run, args=(message, list(tracker.path), recipient, who), daemon=True,
                 ).start()
 
         if admin_state["discord_test_mode"]:
@@ -987,34 +1132,41 @@ def receive_overland_batch():
                 pace = stats["current_pace_display"]  # None while paused
                 if pace:
                     logger.info("TEST MODE update: %s", pace)
-                    send_dm(f"Pace: {pace}{target_note(stats['current_pace_seconds'])}")
+                    notify(f"Pace: {pace}{target_note(stats['current_pace_seconds'])}")
                     last_test_dm_time = timestamp
-        elif event:
-            if event["type"] == "split":
+        else:
+            if event and event["type"] == "split":
                 logger.info("MILE %d SPLIT: %s", event["mile"], event["pace_display"])
-                send_dm(f"Mile {event['mile']} - Pace: {event['pace_display']}{target_note(event['pace_seconds'])}")
-            else:
+                notify(f"Mile {event['mile']} - Pace: {event['pace_display']}{target_note(event['pace_seconds'])}", "dm_mile_splits")
+                record_message = new_record_message(event)
+                if record_message:
+                    logger.info("NEW RECORD: mile %d at %s", event["mile"], event["pace_display"])
+                    notify(record_message, "dm_new_record")
+            elif event:
                 stats = tracker.current_stats()
                 logger.info("Halfway checkpoint at mile %.1f: avg pace %s", event["mile"], stats["average_pace_display"])
                 if stats["average_pace_display"]:
-                    send_dm(f"Pace: {stats['average_pace_display']}{target_note(stats['average_pace_seconds'])}")
+                    notify(f"Pace: {stats['average_pace_display']}{target_note(stats['average_pace_seconds'])}", "dm_half_mile")
+            check_pace()
 
-        goal = admin_state["goal_distance_miles"]
-        distance_miles = tracker.cumulative_meters / MILE_METERS
-        if goal and not tracker.goal_half_notified and distance_miles >= goal / 2:
+        # Goal DMs fire on the crossing itself, like the 6.7 DM - so turning
+        # the goal (or a goal DM) on after passing a mark never sends a late one.
+        goal = effective_goal()
+        if goal and not tracker.goal_half_notified and meters_before < goal / 2 * MILE_METERS <= tracker.cumulative_meters:
             tracker.goal_half_notified = True
             dm_checkpoint_hit = True
             stats = tracker.current_stats()
             logger.info("GOAL HALFWAY: %.2f / %.2f mi", goal / 2, goal)
-            send_dm(
+            notify(
                 f"Halfway to goal! {goal / 2:.2f} / {goal:.2f} mi - Avg pace: {stats['average_pace_display']}"
-                f"{target_note(stats['average_pace_seconds'])}"
+                f"{target_note(stats['average_pace_seconds'])}",
+                "dm_goal_halfway",
             )
-        if goal and not tracker.goal_notified and distance_miles >= goal:
+        if goal and not tracker.goal_notified and meters_before < goal * MILE_METERS <= tracker.cumulative_meters:
             tracker.goal_notified = True
             dm_checkpoint_hit = True
             logger.info("GOAL REACHED: %.2f mi", goal)
-            send_dm(f"Goal reached! {goal:.2f} mi")
+            notify(f"Goal reached! {goal:.2f} mi", "dm_goal_reached")
 
     if PERSISTENCE_ENABLED and tracker.active:
         if tracker.test_mode_used:
@@ -1032,7 +1184,7 @@ def receive_overland_batch():
             target=announce_trip_start,
             args=(
                 recording["run_id"], tracker.start_time, start_lat, start_lon,
-                admin_state["goal_distance_miles"], effective_target_pace(),
+                effective_goal(), effective_target_pace(),
             ),
             daemon=True,
         )

@@ -47,6 +47,7 @@
     }
     .legend-dot.fastest { background: #ffc107; box-shadow: 0 0 0 1px #212529; }
     .legend-star { vertical-align: -2px; }
+    #map-legend[hidden] { display: none !important; }  /* its d-flex would otherwise override hidden */
     .stat-value { font-size: clamp(1.05rem, 5vw, 1.5rem); }
 
     #pace-chart { height: 200px; }
@@ -208,12 +209,18 @@
           </div>
           <div>
             <label for="admin-goal-input" class="form-label small text-muted">
-              Goal distance (miles, 0.01-99.99)
+              Goal distance (miles, 0.01-99.99) - switching it off keeps the distance for later
             </label>
-            <div class="input-group" style="max-width: 100%; width: 320px;">
-              <input type="number" id="admin-goal-input" class="form-control" step="0.01" min="0.01" max="99.99" placeholder="e.g. 13.1">
-              <button id="admin-goal-set" class="btn btn-primary">Set</button>
-              <button id="admin-goal-clear" class="btn btn-outline-secondary">Clear</button>
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" role="switch" id="admin-goal-enabled">
+                <label class="form-check-label small" for="admin-goal-enabled">On</label>
+              </div>
+              <div class="input-group" style="max-width: 100%; width: 300px;">
+                <input type="number" id="admin-goal-input" class="form-control" step="0.01" min="0.01" max="99.99" placeholder="e.g. 13.1">
+                <button id="admin-goal-set" class="btn btn-primary">Set</button>
+                <button id="admin-goal-clear" class="btn btn-outline-secondary">Clear</button>
+              </div>
             </div>
           </div>
           <div class="mt-3">
@@ -248,6 +255,17 @@
             </div>
             <div id="admin-67-note" class="small text-warning-emphasis mt-1" hidden>
               SIX_SEVEN_DISCORD_ID isn't set, so this DM can only go to you (test mode or the test button).
+            </div>
+          </div>
+          <div class="mt-3">
+            <div class="form-label small text-muted mb-1">Discord updates</div>
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" role="switch" id="dm_muted">
+              <label class="form-check-label small fw-semibold" for="dm_muted">Mute all DMs (keeps the switches below as they are)</label>
+            </div>
+            <div id="dm-switches" class="ms-1 mt-1"></div>
+            <div id="dm-muted-note" class="small text-warning-emphasis" hidden>
+              All automatic DMs are muted, including the 6.7 DM. The test button above still works.
             </div>
           </div>
           <hr>
@@ -910,7 +928,43 @@
     for (let m = 1; m <= 10; m++) targetMin.add(new Option(String(m), String(m)));
     for (let s = 0; s <= 59; s++) targetSec.add(new Option(String(s).padStart(2, '0'), String(s)));
 
+    // Discord update switches: [setting name, label]. Each saves on its own.
+    const DM_SWITCHES = [
+      ['dm_tracking_started', 'Tracking started (with the weather)'],
+      ['dm_mile_splits', 'Mile splits'],
+      ['dm_half_mile', 'Half-mile pace updates'],
+      ['dm_goal_halfway', 'Halfway to goal'],
+      ['dm_goal_reached', 'Goal reached'],
+      ['dm_target_comparison', 'Compare to target pace ("8s faster than target")'],
+      ['dm_new_record', 'New fastest mile ever'],
+      ['dm_run_summary', 'End-of-run summary (with route map)'],
+      ['dm_pace_check', 'Pace check (a nudge when the last quarter mile is 15s+/mi slower than target)'],
+    ];
+    const DM_LABELS = Object.fromEntries(DM_SWITCHES);
+
+    const dmSwitchBox = document.getElementById('dm-switches');
+    for (const [name, label] of DM_SWITCHES) {
+      const wrap = document.createElement('div');
+      wrap.className = 'form-check form-switch';
+      const input = document.createElement('input');
+      input.className = 'form-check-input';
+      input.type = 'checkbox';
+      input.setAttribute('role', 'switch');
+      input.id = name;
+      const text = document.createElement('label');
+      text.className = 'form-check-label small';
+      text.htmlFor = name;
+      text.textContent = label;
+      wrap.append(input, text);
+      dmSwitchBox.appendChild(wrap);
+    }
+
     function fillAdminControls(data) {
+      for (const [name] of DM_SWITCHES) document.getElementById(name).checked = !!data[name];
+      document.getElementById('dm_muted').checked = !!data.dm_muted;
+      document.getElementById('dm-muted-note').hidden = !data.dm_muted;
+      dmSwitchBox.style.opacity = data.dm_muted ? 0.5 : 1;  // still editable, just visibly overridden
+      document.getElementById('admin-goal-enabled').checked = !!data.goal_enabled && data.goal_distance_miles != null;
       document.getElementById('admin-goal-input').value = data.goal_distance_miles ?? '';
       const target = data.target_pace_seconds ?? 450;  // default the dropdowns to 7:30
       targetMin.value = String(Math.floor(target / 60));
@@ -995,7 +1049,8 @@
         showSaved(statusEl, data.goal_distance_miles
           ? `Goal set to ${data.goal_distance_miles.toFixed(2)} mi.`
           : 'Goal cleared.', 'text-success', data);
-        document.getElementById('admin-goal-input').value = data.goal_distance_miles ?? '';
+        fillAdminControls(data);  // setting a goal also switches it on
+        refresh();
       } catch (err) {
         statusEl.textContent = 'Request failed - check the console.';
         statusEl.className = 'small text-danger mt-3';
@@ -1058,6 +1113,41 @@
 
     ['admin-67-enabled', 'admin-67-test'].forEach(id =>
       document.getElementById(id).addEventListener('change', saveSixSeven));
+
+    // One handler for every on/off switch that maps straight to a setting.
+    async function saveSwitch(input, name, describe) {
+      const statusEl = document.getElementById('admin-status');
+      const wanted = input.checked;
+      try {
+        const { ok, status, data } = await callAdminSettings({ [name]: wanted });
+        if (!ok) {
+          if (status === 401) showLoggedOut();
+          input.checked = !wanted;  // put the switch back - nothing changed
+          statusEl.textContent = data.error || 'Request failed.';
+          statusEl.className = 'small text-danger mt-3';
+          return;
+        }
+        fillAdminControls(data);
+        showSaved(statusEl, describe(data[name]), 'text-success', data);
+        refresh();
+      } catch (err) {
+        input.checked = !wanted;
+        statusEl.textContent = 'Request failed - check the console.';
+        statusEl.className = 'small text-danger mt-3';
+        console.error(`saving ${name} failed`, err);
+      }
+    }
+
+    for (const [name, label] of DM_SWITCHES) {
+      const input = document.getElementById(name);
+      input.addEventListener('change', () => saveSwitch(input, name, on => `${label}: ${on ? 'on' : 'off'}.`));
+    }
+    const muteInput = document.getElementById('dm_muted');
+    muteInput.addEventListener('change', () =>
+      saveSwitch(muteInput, 'dm_muted', on => (on ? 'All DMs muted.' : 'DMs unmuted - your switches apply again.')));
+    const goalSwitch = document.getElementById('admin-goal-enabled');
+    goalSwitch.addEventListener('change', () =>
+      saveSwitch(goalSwitch, 'goal_enabled', on => (on ? 'Goal on.' : 'Goal off (distance kept for later).')));
 
     document.getElementById('admin-67-send-test').addEventListener('click', async (event) => {
       const button = event.currentTarget;

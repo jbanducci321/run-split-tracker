@@ -107,6 +107,23 @@ class RunTracker:
         self.goal_half_notified = False
         self.test_mode_used = False  # set by app.py - a run with test mode on at any point never counts for records
         self.timezone = None  # e.g. "America/Los_Angeles", set by app.py from the start-of-run weather lookup
+        self.pace_alert_armed = True  # pace-check DM state, managed by app.py
+        self.last_pace_alert_moving = None
+        # (cumulative meters, moving seconds) after each counted point - for recent_pace().
+        # ~30 min of points at a 5s interval, far more than any window used.
+        self.progress = deque(maxlen=400)
+
+    def recent_pace(self, window_meters):
+        """Moving-time pace (seconds per mile) over roughly the last
+        window_meters of the run, or None until that much has been covered."""
+        if not self.progress:
+            return None
+        meters_now, moving_now = self.progress[-1]
+        for meters_then, moving_then in reversed(self.progress):
+            covered = meters_now - meters_then
+            if covered >= window_meters:
+                return (moving_now - moving_then) / (covered / MILE_METERS)
+        return None
 
     def _snap_to_path(self, lat, lon):
         """The closest spot on the recent part of the drawn (smoothed) path, so
@@ -279,6 +296,7 @@ class RunTracker:
         self.cumulative_meters += distance
         self.moving_seconds += moving_portion
         self.distance_anchor = (lat, lon, timestamp)
+        self.progress.append((self.cumulative_meters, self.moving_seconds))
 
         if self.cumulative_meters < self.next_checkpoint_meters:
             return None
