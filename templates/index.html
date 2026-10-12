@@ -130,6 +130,7 @@
           <div class="card-body text-center">
             <div class="text-muted small">Average Pace</div>
             <div id="stat-avg-pace" class="stat-value fw-bold">-</div>
+            <div id="stat-avg-gap" class="text-muted small" title="Grade-adjusted pace: about what this effort would be on flat ground"></div>
           </div>
         </div>
       </div>
@@ -592,7 +593,8 @@
         seen.add(s.mile);
         const kind = s.mile === recordMile ? 'record' : (s.mile === fastestMile ? 'fastest' : 'mile');
         const note = kind === 'record' ? 'Fastest mile split ever' : (kind === 'fastest' ? 'Fastest this run' : '');
-        const climb = s.elevation_gain_ft != null ? `<br>↑${s.elevation_gain_ft} ft ↓${s.elevation_loss_ft} ft` : '';
+        const climb = (s.gap_display ? `<br>GAP ${s.gap_display}` : '') +
+          (s.elevation_gain_ft != null ? `<br>↑${s.elevation_gain_ft} ft ↓${s.elevation_loss_ft} ft` : '');
         const tooltip =
           `<strong>Mile ${s.mile}</strong>: ${s.pace_display}${climb}<br>` +
           `<span class="mile-tooltip-note">at ${s.at_display} moving${note ? ` &middot; ${note}` : ''}</span>`;
@@ -1103,9 +1105,13 @@
 
     // "↑79 ↓45 ft" for a split, or '' until its elevation is known
     // (about 40 m after the mile mark, once smoothing has passed it).
+    // "· GAP 7:03 · ↑79 ↓50 ft" for a split; each part appears once it's known
+    // (about 30 s / 40 m after the mile mark, once smoothing has passed it).
     function elevationText(split, prefix) {
-      if (split.elevation_gain_ft == null) return '';
-      return `${prefix}<span class="text-muted small">↑${split.elevation_gain_ft} ↓${split.elevation_loss_ft} ft</span>`;
+      const parts = [];
+      if (split.gap_display) parts.push(`GAP ${split.gap_display.replace('/mi', '')}`);
+      if (split.elevation_gain_ft != null) parts.push(`↑${split.elevation_gain_ft} ↓${split.elevation_loss_ft} ft`);
+      return parts.length ? `${prefix}<span class="text-muted small">${parts.join(' · ')}</span>` : '';
     }
 
     // --- "Updated 6s ago" under the badge during a run, so viewers can tell a
@@ -1191,6 +1197,7 @@
         document.getElementById('stat-elapsed').textContent =
           data.elapsed_display && data.elapsed_display !== data.moving_display ? `Elapsed ${data.elapsed_display}` : '';
         document.getElementById('stat-avg-pace').textContent = data.average_pace_display || '-';
+        document.getElementById('stat-avg-gap').textContent = data.average_gap_display ? `GAP ${data.average_gap_display}` : '';
         const fourthLabel = document.getElementById('stat-fourth-label');
         const fourthValue = document.getElementById('stat-fourth-value');
         if (data.active) {

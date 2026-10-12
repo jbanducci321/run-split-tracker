@@ -202,9 +202,10 @@ def run_summary_message(summary, goal_reached_miles):
     """The end-of-run DM text, or None for a run too short to summarize."""
     if summary["distance_miles"] < RUN_SUMMARY_MIN_MILES:
         return None
+    gap = summary.get("average_gap_display")
     lines = [
         f"Run complete: {summary['distance_miles']:.2f} mi in {summary['moving_display']}"
-        f" - avg {summary['average_pace_display'] or 'unknown pace'}"
+        f" - avg {summary['average_pace_display'] or 'unknown pace'}{f' (GAP {gap})' if gap else ''}"
     ]
     fastest = summary["fastest_split"]
     if fastest:

@@ -66,6 +66,27 @@ FEET_PER_METER = 3.28084
 ALTITUDE_GLITCH_WINDOW_SECONDS = 30
 ALTITUDE_GLITCH_METERS = 8
 
+# Grade-adjusted pace (GAP): roughly the pace the same effort would give on
+# flat ground. The route is cut into GAP_SEGMENT_METERS pieces; each piece's
+# grade (from the smoothed elevation) scales its distance by how much harder
+# or easier that grade is than flat, and GAP = time / that adjusted distance.
+# The cost of a grade comes from Minetti et al. (2002, treadmill energy cost),
+# scaled down - the lab curve overstates hills compared with real running,
+# especially the benefit of downhills. The two strengths were fit to Strava's
+# GAP on 9 miles of real runs, then checked on 11 more it hadn't seen: about
+# 2 s/mi off on those (worst 5 s), vs ~6 s with the unscaled curve.
+GAP_SEGMENT_METERS = 50
+GAP_UPHILL_STRENGTH = 0.55
+GAP_DOWNHILL_STRENGTH = 0.35
+
+
+def grade_cost_ratio(grade):
+    """How much harder (>1) or easier (<1) running at this grade is than flat."""
+    g = max(-0.45, min(0.45, grade))  # the range the formula was measured over
+    cost = 155.4 * g**5 - 30.4 * g**4 - 43.3 * g**3 + 46.3 * g**2 + 19.5 * g + 3.6  # J/kg/m
+    strength = GAP_UPHILL_STRENGTH if g > 0 else GAP_DOWNHILL_STRENGTH
+    return 1 + strength * (cost / 3.6 - 1)
+
 
 # Best efforts: the fastest stretch of each standard distance anywhere in a
 # run, timed with moving time like splits. (key, display name, meters)
@@ -321,16 +342,50 @@ class RunTracker:
             self.elev_profile.append((run_meters, altitude, self.climb.gain, self.climb.loss, path_index))
         self.elev_window = [lo, hi, total]
 
-    def _elevation_at(self, run_meters):
-        """(gain so far m, loss so far m, altitude m) at the last smoothed point at or before run_meters."""
-        lo, hi = 0, len(self.elev_profile)  # binary search - run meters only grow along the profile
+    def _profile_count_through(self, run_meters, inclusive=True):
+        """How many smoothed points lie at or before (or, not inclusive, strictly
+        before) run_meters - a binary search, since run meters only grow."""
+        lo, hi = 0, len(self.elev_profile)
         while lo < hi:
             mid = (lo + hi) // 2
-            if self.elev_profile[mid][0] <= run_meters:
+            meters = self.elev_profile[mid][0]
+            if meters < run_meters or (inclusive and meters == run_meters):
                 lo = mid + 1
             else:
                 hi = mid
-        index = lo - 1
+        return lo
+
+    def _gap_ratio(self, start_meters, end_meters):
+        """GAP / actual pace over a stretch of the run (below 1 = it was hillier
+        than flat), or None if it hasn't been smoothed that far yet."""
+        if not self.elev_profile or self.elev_profile[-1][0] < end_meters:
+            return None
+        first = self._profile_count_through(start_meters, inclusive=False)
+        last = self._profile_count_through(end_meters)
+        actual = adjusted = 0.0
+        piece_start = None
+        for run_meters, altitude, *_ in self.elev_profile[first:last]:
+            if piece_start is None:
+                piece_start = (run_meters, altitude)
+                continue
+            length = run_meters - piece_start[0]
+            if length >= GAP_SEGMENT_METERS:
+                actual += length
+                adjusted += length * grade_cost_ratio((altitude - piece_start[1]) / length)
+                piece_start = (run_meters, altitude)
+        return actual / adjusted if adjusted else None
+
+    def _gap(self, pace_seconds, start_meters, end_meters):
+        """{gap_seconds, gap_display} for a stretch run at pace_seconds (None values until known)."""
+        ratio = self._gap_ratio(start_meters, end_meters) if pace_seconds else None
+        if ratio is None:
+            return {"gap_seconds": None, "gap_display": None}
+        gap = pace_seconds * ratio
+        return {"gap_seconds": round(gap, 1), "gap_display": format_pace(gap)}
+
+    def _elevation_at(self, run_meters):
+        """(gain so far m, loss so far m, altitude m) at the last smoothed point at or before run_meters."""
+        index = self._profile_count_through(run_meters) - 1
         if index < 0:
             return 0.0, 0.0, None
         _, altitude, gain, loss, _ = self.elev_profile[index]
@@ -433,6 +488,11 @@ class RunTracker:
             "moving_display": format_duration(moving_seconds),
             "average_pace_seconds": round(average_pace_seconds, 1) if average_pace_seconds else None,
             "average_pace_display": format_pace(average_pace_seconds) if average_pace_seconds else None,
+            # Whole-run GAP: the average pace adjusted by the hills smoothed so far
+            # (all of them once the run ends; ~30 s behind during it).
+            **{f"average_{k}": v for k, v in self._gap(
+                average_pace_seconds, 0.0, self.elev_profile[-1][0] if self.elev_profile else 0.0,
+            ).items()},
             "current_pace_seconds": round(current_pace_seconds, 1) if current_pace_seconds else None,
             "current_pace_display": format_pace(current_pace_seconds) if current_pace_seconds else None,
             "splits": [
@@ -446,8 +506,9 @@ class RunTracker:
                     # path[previous path_end:path_end], then this marker.
                     "path_end": s["path_end"],
                     "at_display": format_duration(s["crossing_moving"]),  # moving time when the mile was finished
-                    # Filled in once smoothing has passed the mile mark (~40 m after it).
+                    # Filled in once smoothing has passed the mile mark (~30 s / 40 m after it).
                     **self._elevation_between((s["mile"] - 1) * MILE_METERS, s["mile"] * MILE_METERS),
+                    **self._gap(s["pace_seconds"], (s["mile"] - 1) * MILE_METERS, s["mile"] * MILE_METERS),
                 }
                 for s in self.splits
             ],
@@ -457,6 +518,7 @@ class RunTracker:
                 "pace_seconds": round(partial_pace_seconds, 1),
                 "pace_display": format_pace(partial_pace_seconds),
                 **self._elevation_between((self.next_split_mile - 1) * MILE_METERS, self.cumulative_meters),
+                **self._gap(partial_pace_seconds, (self.next_split_mile - 1) * MILE_METERS, self.cumulative_meters),
             } if partial_pace_seconds else None,
             "path": [[lat, lon] for lat, lon in self.path],
             # Total climbing/descending so far (None until there's altitude data).
