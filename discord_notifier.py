@@ -7,8 +7,18 @@ import requests
 logger = logging.getLogger("run-split-tracker")
 
 DISCORD_API = "https://discord.com/api/v10"
-BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-USER_ID = os.environ.get("DISCORD_USER_ID", "")
+
+
+# Read when a DM is sent, not when this file is imported: app.py imports this
+# before load_dotenv() reads .env, so values captured at import were blank on
+# a laptop (Railway sets real environment variables before start, so it never hit this).
+def _bot_token():
+    return os.environ.get("DISCORD_BOT_TOKEN", "")
+
+
+def _your_user_id():
+    return os.environ.get("DISCORD_USER_ID", "")
+
 
 _dm_channel_ids = {}  # recipient user id -> DM channel id
 
@@ -16,13 +26,13 @@ _dm_channel_ids = {}  # recipient user id -> DM channel id
 def _get_dm_channel_id(user_id):
     if user_id in _dm_channel_ids:
         return _dm_channel_ids[user_id]
-    if not (BOT_TOKEN and user_id):
+    if not (_bot_token() and user_id):
         logger.warning("DISCORD_BOT_TOKEN or recipient user id not set - skipping DM")
         return None
 
     resp = requests.post(
         f"{DISCORD_API}/users/@me/channels",
-        headers={"Authorization": f"Bot {BOT_TOKEN}"},
+        headers={"Authorization": f"Bot {_bot_token()}"},
         json={"recipient_id": user_id},
         timeout=10,
     )
@@ -40,16 +50,17 @@ def send_dm(message, user_id=None, image_png=None, label=None):
     Every call logs one line - "DM sent" or "DM FAILED" - with who it was for
     (label, or the user id) and the message, so the logs show each DM's fate.
     """
-    recipient = label or ("you" if not user_id or user_id == USER_ID else f"user {user_id}")
+    you = _your_user_id()
+    recipient = label or ("you" if not user_id or user_id == you else f"user {user_id}")
     attachment = " [+ image]" if image_png else ""
     try:
-        channel_id = _get_dm_channel_id(user_id or USER_ID)
+        channel_id = _get_dm_channel_id(user_id or you)
         if not channel_id:
             logger.warning("DM FAILED to %s (couldn't open a DM channel): %s%s", recipient, message, attachment)
             return False
 
         url = f"{DISCORD_API}/channels/{channel_id}/messages"
-        headers = {"Authorization": f"Bot {BOT_TOKEN}"}
+        headers = {"Authorization": f"Bot {_bot_token()}"}
         if image_png:
             payload = {"content": message, "attachments": [{"id": 0, "filename": "route.png"}]}
             resp = requests.post(

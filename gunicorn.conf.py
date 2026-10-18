@@ -40,6 +40,9 @@ logconfig_dict = {
     "root": {"level": "INFO", "handlers": []},  # app.configure_logging() adds the app's handlers
     "loggers": {
         "gunicorn.error": {"level": "INFO", "handlers": ["gunicorn_stdout", "gunicorn_stderr"], "propagate": False},
-        "gunicorn.access": {"level": "INFO", "handlers": ["gunicorn_stdout"], "propagate": False},
+        # Gunicorn turns on a line per web request whenever a logging config is
+        # given - that would be one line every 3 s per open dashboard. Kept off,
+        # as it was before this file existed.
+        "gunicorn.access": {"level": "CRITICAL", "handlers": [], "propagate": False},
     },
 }
